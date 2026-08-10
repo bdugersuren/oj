@@ -1,0 +1,4 @@
+2026/08/09 08:53:07 [warn] 321#321: *10319 an upstream response is buffered to a temporary file /var/cache/nginx/proxy_temp/8/23/0000002238 while reading upstream, client: 172.18.0.1, server: minio.know.mn, request: "GET /static/js/main.bb7c7604.js.map HTTP/1.1", upstream: "http://172.18.0.2:9001/static/js/main.bb7c7604.js.map", host: "minio.know.mn"
+2026/08/09 14:28:12 [error] 468#468: *14438 minio could not be resolved (2: Server failure), client: 172.18.0.1, server: minio.know.mn, request: "GET /ws/objectManager HTTP/1.1", host: "minio.know.mn"
+2026/08/09 14:28:16 [error] 468#468: *14439 minio could not be resolved (2: Server failure), client: 172.18.0.1, server: minio.know.mn, request: "GET /ws/objectManager HTTP/1.1", host: "minio.know.mn"
+2026/08/09 14:28:20 [error] 468#468: *14440 minio could not be resolved (2: Server failure), client: 172.18.0.1, server: minio.know.mn, request: "GET /ws/objectManager HTTP/1.1", host: "minio.know.mn"

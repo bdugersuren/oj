@@ -1,0 +1,237 @@
+services:
+  # 1. Frontend Single Page Application (Next.js 15)
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: oj-nextjs
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+    depends_on:
+      - api
+    networks:
+      - oj-network
+
+  # 2. Backend REST API Gateway (FastAPI)
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: oj-fastapi
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - problems_data:/problems
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - oj-network
+
+  # 3. PostgreSQL Database
+  db:
+    build:
+      context: ./config/postgres
+      dockerfile: Dockerfile
+    container_name: oj-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-oj_db}
+      POSTGRES_USER: ${POSTGRES_USER:-oj_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oj_secure_password_2026}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-oj_user} -d ${POSTGRES_DB:-oj_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - oj-network
+
+  # 4. Redis Caching, WebSocket PubSub & Task Queue
+  redis:
+    build:
+      context: ./config/redis
+      dockerfile: Dockerfile
+    container_name: oj-redis
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - oj-network
+
+  # 5. MinIO Object Storage (Problem Statements, PDFs, Testcases, Assets)
+  minio:
+    build:
+      context: ./config/minio
+      dockerfile: Dockerfile
+    container_name: oj-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin_secure_2026}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    networks:
+      - oj-network
+
+  # 6. Celery Async Task Worker (Grading Dispatcher & PDF Reporting)
+  celery:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: oj-celery
+    restart: unless-stopped
+    command: celery -A app.core.celery_app worker --loglevel=info -Q judge_queue,celery --concurrency=4
+    env_file:
+      - .env
+    environment:
+      ENABLE_JUDGE: "true"
+    volumes:
+      - problems_data:/problems
+    depends_on:
+      - api
+      - redis
+      - bridge
+    networks:
+      - oj-network
+
+  # 7. DMOJ tier-3 Judge Bridge
+  bridge:
+    build:
+      context: ./judge/bridge
+      dockerfile: Dockerfile
+    image: oj-dmoj-tier3
+    container_name: oj-dmoj-bridge
+    restart: unless-stopped
+    volumes:
+      - ./judge/judge-tier3/judge.yml:/judge/judge.yml:ro
+      - problems_data:/problems
+    networks:
+      - oj-network
+
+  # Nginx Proxy Manager (NPM)
+  npm:
+    build:
+      context: ./config/npm-build
+      dockerfile: Dockerfile
+    container_name: oj-npm
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '81:81'
+      - '443:443'
+    volumes:
+      - ./config/npm/data:/data
+      - ./config/npm/letsencrypt:/etc/letsencrypt
+    depends_on:
+      - web
+      - api
+      - minio
+    networks:
+      - oj-network
+
+  # 8. Ollama Local LLM Service
+  ollama:
+    build:
+      context: ./config/ollama
+      dockerfile: Dockerfile
+    container_name: oj-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollamadata:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - oj-network
+
+  # 9. Open WebUI (AI testing & prompt management)
+  open-webui:
+    build:
+      context: ./config/open-webui
+      dockerfile: Dockerfile
+    container_name: oj-open-webui
+    restart: unless-stopped
+    ports:
+      - "3080:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_SECRET_KEY=supersecretkey-openwebui-2026
+    volumes:
+      - openwebuidata:/app/backend/data
+    depends_on:
+      - ollama
+    networks:
+      - oj-network
+
+  # 10. Qdrant Vector Database
+  qdrant:
+    build:
+      context: ./config/qdrant
+      dockerfile: Dockerfile
+    container_name: oj-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrantdata:/qdrant/storage
+    networks:
+      - oj-network
+
+  # 11. pgAdmin (PostgreSQL Database viewer tool)
+  pgadmin:
+    build:
+      context: ./config/pgadmin
+      dockerfile: Dockerfile
+    container_name: oj-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@know.mn}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin_secure_pass_2026}
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    networks:
+      - oj-network
+
+networks:
+  oj-network:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  problems_data:
+  ollamadata:
+  openwebuidata:
+  qdrantdata:
