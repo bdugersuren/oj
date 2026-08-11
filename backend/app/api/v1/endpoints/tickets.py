@@ -1,7 +1,7 @@
 import logging
 from typing import List, Optional
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 from sqlalchemy.orm import selectinload
@@ -9,10 +9,11 @@ from pydantic import BaseModel
 
 from app.core.database import get_db
 from app.api.v1.endpoints.auth import get_current_user
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.models.problem import Problem
 from app.models.submission import Submission
 from app.models.ticket import Ticket, TicketMessage, TicketStatus
+from app.core.config import settings
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -165,6 +166,7 @@ async def get_ticket_detail(
 @router.post("/", response_model=TicketDetailOut, status_code=status.HTTP_201_CREATED)
 async def create_ticket(
     payload: TicketCreate,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -205,6 +207,9 @@ async def create_ticket(
     )
     db.add(first_message)
     await db.commit()
+
+    if settings.ENABLE_AI:
+        background_tasks.add_task(generate_ai_ticket_response, ticket.id)
 
     return await get_ticket_detail(ticket.id, current_user, db)
 
@@ -275,3 +280,105 @@ async def resolve_ticket(
     await db.commit()
 
     return {"status": "success", "message": "Тасалбарыг амжилттай шийдвэрлэж хаалаа."}
+
+
+async def generate_ai_ticket_response(ticket_id: int):
+    """
+    Background Task: Шинэ тасалбарт AI туслах багшийн зүгээс эхний Socratic хариултыг илгээнэ.
+    """
+    from app.core.database import AsyncSessionLocal
+    from app.models.user import User, UserRole
+    from app.services.ai_service import ai_service_client
+    import uuid
+
+    async with AsyncSessionLocal() as db:
+        try:
+            # 1. Тасалбарыг ачаалах
+            res = await db.execute(
+                select(Ticket)
+                .options(selectinload(Ticket.messages))
+                .where(Ticket.id == ticket_id)
+            )
+            ticket = res.scalar_one_or_none()
+            if not ticket:
+                return
+
+            # 2. Бодлогын мэдээлэл авах
+            p_res = await db.execute(select(Problem).where(Problem.id == ticket.problem_id))
+            problem = p_res.scalar_one_or_none()
+            if not problem:
+                return
+
+            # 3. Сурагчийн илгээсэн код болон алдааны лог авах
+            student_code = ""
+            last_error = None
+            if ticket.submission_id:
+                sub_res = await db.execute(select(Submission).where(Submission.id == ticket.submission_id))
+                sub = sub_res.scalar_one_or_none()
+                if sub:
+                    student_code = sub.source_code or ""
+                    last_error = sub.error_log
+
+            # 4. Эхний асуулт / тайлбар
+            first_msg = ticket.messages[0].content if ticket.messages else ""
+
+            # 5. AI Mentor хэрэглэгчийг DB-ээс олох эсвэл шинээр үүсгэх
+            ai_res = await db.execute(select(User).where(User.username == "ai_mentor"))
+            ai_user = ai_res.scalar_one_or_none()
+            if not ai_user:
+                # Багш эрхтэй хиймэл оюуны туслах үүсгэх (хуудсанд зүүн талд харагдахын тулд)
+                ai_user = User(
+                    username="ai_mentor",
+                    email="ai_mentor@oj.know.mn",
+                    hashed_password="ai_mentor_dummy_password_hash_2026",
+                    role=UserRole.TEACHER,
+                    full_name="AI Mentor (Туслах Багш)",
+                    is_verified=True,
+                    is_active=True
+                )
+                db.add(ai_user)
+                await db.flush()
+
+            # 6. AI Mentor-оос Socratic чиглүүлэг авах
+            title, msg, _, followups = await ai_service_client.ask_socratic_mentor(
+                problem_code=problem.code,
+                problem_title=problem.title,
+                problem_statement=problem.statement_markdown,
+                student_code=student_code,
+                student_question=first_msg,
+                hint_level=1,  # Concept-level hint
+                last_error=last_error
+            )
+
+            # 7. Зурвас бэлдэх
+            content = f"### 🤖 {title}\n\n{msg}\n\n"
+            if followups:
+                content += "**Чиглүүлэх асуултууд:**\n"
+                for q in followups:
+                    content += f"- {q}\n"
+
+            # 8. Хариулт нэмэх
+            ai_reply = TicketMessage(
+                ticket_id=ticket.id,
+                sender_id=ai_user.id,
+                content=content
+            )
+            db.add(ai_reply)
+
+            # 9. Тасалбарын статусыг шинэчлэх
+            ticket.status = TicketStatus.ANSWERED
+            await db.commit()
+
+            # 10. Redis Pub/Sub эсвэл WebSocket-ээр сурагчид мэдэгдэх
+            try:
+                from app.workers.judge_worker import _publish_gamification_event
+                _publish_gamification_event(ticket.student_id, {
+                    "event": "TICKET_ANSWERED",
+                    "ticket_id": ticket.id,
+                    "message": "AI Mentor таны тасалбарт зөвлөгөө илгээлээ."
+                })
+            except Exception:
+                pass
+
+        except Exception as exc:
+            logger.exception(f"Error in generate_ai_ticket_response: {exc}")

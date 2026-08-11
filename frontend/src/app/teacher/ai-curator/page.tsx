@@ -14,9 +14,11 @@ import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from "@/components/ui/card";
 import { aiCuratorApi, TopicData } from "@/lib/api/ai-curator";
+import { authApi } from "@/lib/api/auth";
 import toast from "react-hot-toast";
 
 export default function AICuratorPage() {
+  const [currentUser, setCurrentUser] = useState<any>(null);
   const [dataList, setDataList] = useState<TopicData[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [activeTab, setActiveTab] = useState("drafts");
@@ -54,6 +56,9 @@ export default function AICuratorPage() {
 
   useEffect(() => {
     fetchData();
+    authApi.me()
+      .then((user) => setCurrentUser(user))
+      .catch((err) => console.log("curator load user error:", err));
   }, []);
 
   const handleIngest = async (e: React.FormEvent) => {
@@ -133,6 +138,17 @@ export default function AICuratorPage() {
       fetchData();
     } catch (err) {
       toast.error("Алдаа гарлаа.");
+    }
+  };
+
+  const handleDelete = async (id: number) => {
+    if (!window.confirm("Та энэ RAG материалыг бааз болон вектор сангаас бүрэн устгахдаа итгэлтэй байна уу?")) return;
+    try {
+      await aiCuratorApi.delete(id);
+      toast.success("Материал бүрэн устгагдлаа.");
+      fetchData();
+    } catch (err) {
+      toast.error("Устгахад алдаа гарлаа.");
     }
   };
 
@@ -511,6 +527,17 @@ export default function AICuratorPage() {
                                     title="Батлах төлөвт оруулах"
                                   >
                                     <CheckCircle className="w-4 h-4" />
+                                  </Button>
+                                )}
+                                {currentUser?.role === "admin" && (
+                                  <Button
+                                    onClick={() => handleDelete(item.id)}
+                                    variant="ghost"
+                                    size="icon"
+                                    className="rounded-xl w-8 h-8 text-rose-600 hover:bg-rose-600/10 hover:text-rose-700"
+                                    title="Баазаас бүрэн устгах"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
                                   </Button>
                                 )}
                               </div>

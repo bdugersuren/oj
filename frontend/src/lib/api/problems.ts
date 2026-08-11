@@ -55,6 +55,29 @@ export interface JudgeResult {
   time_ms: number; 
   memory_kb: number; 
   output_log?: string | null; 
+  actual_output?: string | null;
+}
+
+export interface SubmissionBatchCase {
+  id?: number | null;
+  testcase_id?: number | null;
+  status: string;
+  time_ms: number;
+  memory_kb: number;
+  output_log?: string | null;
+  actual_output?: string | null;
+  points: number;
+  in_file?: string | null;
+  out_file?: string | null;
+  sample?: boolean;
+}
+
+export interface SubmissionBatch {
+  batch_index: number;
+  points: number;
+  total_points: number;
+  status: string;
+  cases: SubmissionBatchCase[];
 }
 
 export interface Submission { 
@@ -68,10 +91,13 @@ export interface Submission {
   submitted_at: string; 
   is_pending?: boolean; 
   error_log?: string | null; 
+  source_code?: string;
+  is_batched?: boolean;
+  batches?: SubmissionBatch[];
   judge_results: JudgeResult[]; 
 }
 
-export type SubmissionListItem = Omit<Submission, "judge_results" | "is_pending" | "error_log">;
+export type SubmissionListItem = Omit<Submission, "judge_results" | "is_pending" | "error_log" | "is_batched" | "batches">;
 
 export const problemApi = {
   list: (params?: Record<string, string | number | boolean | undefined>) => 
@@ -80,8 +106,8 @@ export const problemApi = {
   get: (code: string) => 
     api.get<ProblemDetail>(`/problems/${code}`).then((r) => r.data),
   
-  submit: (problem_code: string, language: string, source_code: string) => 
-    api.post<{ submission_id: number; status: string }>("/submissions/", { problem_code, language, source_code }).then((r) => r.data),
+  submit: (problem_code: string, language: string, source_code: string, is_sample_test: boolean = false) => 
+    api.post<{ submission_id: number; status: string }>("/submissions/", { problem_code, language, source_code, is_sample_test }).then((r) => r.data),
   
   submission: (id: number) => 
     api.get<Submission>(`/submissions/${id}`).then((r) => r.data),
@@ -143,4 +169,49 @@ export const problemApi = {
   },
   getStatementPdf: (code: string) =>
     api.get<{ url: string }>(`/problems/${code}/statement-pdf`).then((r) => r.data),
+
+  runSamples: (code: string, language: string, source_code: string) =>
+    api.post<{
+      status: string;
+      time_ms: number;
+      memory_kb: number;
+      testcases: Array<{
+        testcase_id: number;
+        status: string;
+        time_ms: number;
+        memory_kb: number;
+        actual_output?: string | null;
+        checker_output?: string | null;
+      }>;
+    }>(`/problems/${code}/run-samples`, { language, source_code }).then((r) => r.data),
+
+  leaderboard: (code: string) =>
+    api.get<Array<{
+      rank: number;
+      submission_id: number;
+      username: string;
+      full_name?: string | null;
+      avatar_url?: string | null;
+      language: string;
+      score: number;
+      time_ms: number;
+      memory_kb: number;
+      submitted_at: string;
+    }>>(`/submissions/leaderboard/${code}`).then((r) => r.data),
+
+  exportProblem: (code: string) =>
+    api.get(`/problems/${code}/export`, { responseType: 'blob' }).then((r) => r.data),
+
+  importProblem: (file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return api.post<Problem>("/problems/import", formData, {
+      headers: {
+        "Content-Type": "multipart/form-data",
+      },
+    }).then((r) => r.data);
+  },
+
+  deleteProblem: (code: string) =>
+    api.delete(`/problems/${code}`).then((r) => r.data),
 };

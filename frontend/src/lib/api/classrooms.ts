@@ -28,4 +28,5 @@ export const classroomApi = {
   linkLesson: (classId: number, lessonId: number) => api.post<any>(`/classrooms/${classId}/lessons/${lessonId}`).then((response) => response.data),
   unlinkLesson: (classId: number, lessonId: number) => api.delete(`/classrooms/${classId}/lessons/${lessonId}`).then((response) => response.data),
   updateLessonProperties: (classId: number, lessonId: number, data: { order?: number; is_published?: boolean }) => api.put<any>(`/classrooms/${classId}/lessons/${lessonId}/order`, data).then((response) => response.data),
+  delete: (id: number) => api.delete<any>(`/classrooms/${id}`).then((response) => response.data),
 };

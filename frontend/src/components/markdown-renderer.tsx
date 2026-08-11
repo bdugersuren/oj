@@ -15,9 +15,11 @@ import toast from "react-hot-toast";
 interface MarkdownRendererProps {
   content: string;
   className?: string;
+  problemCode?: string;
+  isDraft?: boolean;
 }
 
-export function MarkdownRenderer({ content, className = "" }: MarkdownRendererProps) {
+export function MarkdownRenderer({ content, className = "", problemCode, isDraft }: MarkdownRendererProps) {
   const [copiedCode, setCopiedCode] = React.useState<string | null>(null);
 
   const handleCopy = (codeStr: string) => {
@@ -79,16 +81,31 @@ export function MarkdownRenderer({ content, className = "" }: MarkdownRendererPr
           td: ({ children }) => (
             <td className="p-3 border-b border-border/50 text-slate-700 dark:text-slate-300">{children}</td>
           ),
-          img: ({ src, alt }) => (
-            <span className="block my-4 text-center">
-              <img
-                src={src}
-                alt={alt || "Зураг"}
-                className="rounded-2xl max-w-full h-auto mx-auto border border-border shadow-md"
-              />
-              {alt && <span className="text-xs text-muted-foreground mt-1.5 block font-medium">{alt}</span>}
-            </span>
-          ),
+          img: ({ src, alt }: { src?: any; alt?: any }) => {
+            let finalSrc = src;
+            if (typeof src === "string" && src && !src.startsWith("http://") && !src.startsWith("https://") && !src.startsWith("/")) {
+              // Normalize and clean prefix
+              const cleanedSrc = src.replace(/^\.\//, "").replace(/^assets\//, "");
+              const apiPrefix = process.env.NEXT_PUBLIC_API_URL || '/api';
+              if (problemCode) {
+                if (isDraft) {
+                  finalSrc = `${apiPrefix}/v1/workspace/${problemCode}/assets/${cleanedSrc}`;
+                } else {
+                  finalSrc = `${apiPrefix}/v1/problems/${problemCode}/assets/${cleanedSrc}`;
+                }
+              }
+            }
+            return (
+              <span className="block my-4 text-center">
+                <img
+                  src={finalSrc}
+                  alt={alt || "Зураг"}
+                  className="rounded-2xl max-w-full h-auto mx-auto border border-border shadow-md"
+                />
+                {alt && <span className="text-xs text-muted-foreground mt-1.5 block font-medium">{alt}</span>}
+              </span>
+            );
+          },
           code: ({ inline, className, children, ...props }: React.ComponentPropsWithoutRef<"code"> & { inline?: boolean }) => {
             const codeText = String(children).replace(/\n$/, "");
             const match = /language-(\w+)/.exec(className || "");

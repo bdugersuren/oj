@@ -6,6 +6,7 @@ services:
       dockerfile: Dockerfile
     container_name: oj-nextjs
     restart: unless-stopped
+
     environment:
       - NODE_ENV=production
     depends_on:
@@ -112,18 +113,34 @@ services:
     depends_on:
       - api
       - redis
-      - bridge
+      - bridge1
+      - bridge2
     networks:
       - oj-network
 
-  # 7. DMOJ tier-3 Judge Bridge
-  bridge:
+  # 7. DMOJ tier-3 Judge Bridge Replicas (Isolated via cpuset)
+  bridge1:
     build:
       context: ./judge/bridge
       dockerfile: Dockerfile
     image: oj-dmoj-tier3
-    container_name: oj-dmoj-bridge
+    container_name: oj-dmoj-bridge-1
     restart: unless-stopped
+    cpuset: "0"  # Pinned to CPU Core 0
+    volumes:
+      - ./judge/judge-tier3/judge.yml:/judge/judge.yml:ro
+      - problems_data:/problems
+    networks:
+      - oj-network
+
+  bridge2:
+    build:
+      context: ./judge/bridge
+      dockerfile: Dockerfile
+    image: oj-dmoj-tier3
+    container_name: oj-dmoj-bridge-2
+    restart: unless-stopped
+    cpuset: "1"  # Pinned to CPU Core 1
     volumes:
       - ./judge/judge-tier3/judge.yml:/judge/judge.yml:ro
       - problems_data:/problems

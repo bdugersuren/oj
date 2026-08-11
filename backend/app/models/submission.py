@@ -1,6 +1,6 @@
 import enum
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, Float, DateTime, ForeignKey, Enum
+from sqlalchemy import Column, Integer, String, Text, Float, DateTime, ForeignKey, Enum, Boolean
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -30,6 +30,7 @@ class Submission(Base):
     memory_kb = Column(Float, default=0.0, nullable=False)
     error_log = Column(Text, nullable=True)
     submitted_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    is_sample_test = Column(Boolean, default=False, nullable=False)
 
     # Relationships
     user = relationship("User", back_populates="submissions")
@@ -46,6 +47,7 @@ class JudgeResult(Base):
     time_ms = Column(Float, default=0.0, nullable=False)
     memory_kb = Column(Float, default=0.0, nullable=False)
     output_log = Column(Text, nullable=True)
+    actual_output = Column(Text, nullable=True)
 
     # Relationships
     submission = relationship("Submission", back_populates="judge_results")

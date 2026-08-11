@@ -1,10 +1,11 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import auth, problems, submissions, progress, tickets, lessons, ai_tutor, classrooms, ws, upload, worlds, contests, ai_curator, admin_settings, admin_users
+from app.api.v1.endpoints import auth, problems, submissions, progress, tickets, lessons, ai_tutor, classrooms, ws, upload, worlds, contests, ai_curator, admin_settings, admin_users, workspace
 
 api_router = APIRouter()
 
 api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 api_router.include_router(problems.router, prefix="/problems", tags=["Problems"])
+api_router.include_router(workspace.router, prefix="/workspace", tags=["Teacher Workspace"])
 api_router.include_router(submissions.router, prefix="/submissions", tags=["Submissions"])
 api_router.include_router(progress.router, prefix="/progress", tags=["Progression & Leaderboard"])
 api_router.include_router(tickets.router, prefix="/tickets", tags=["Support Tickets"])

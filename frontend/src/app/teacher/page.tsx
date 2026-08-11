@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, Plus, Users, Check, X, Grid, FileText, CheckCircle2, BookOpen, Trash2, ArrowUp, ArrowDown, Eye, EyeOff } from "lucide-react";
+import { Download, Plus, Users, Check, X, Grid, FileText, CheckCircle2, BookOpen, Trash2, ArrowUp, ArrowDown, Eye, EyeOff, Loader2 } from "lucide-react";
 import toast from "react-hot-toast";
 import { classroomApi } from "@/lib/api/classrooms";
 import { Badge } from "@/components/ui/badge";
@@ -113,6 +113,7 @@ export default function TeacherPortalPage() {
 
   const [activeTab, setActiveTab] = useState<"overview" | "requests" | "matrix" | "lessons">("overview");
   const [name, setName] = useState("");
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   const create = useMutation({
     mutationFn: () => classroomApi.create(name),
@@ -122,6 +123,17 @@ export default function TeacherPortalPage() {
       toast.success("Анги үүслээ.");
     },
     onError: () => toast.error("Анги үүсгэхэд алдаа гарлаа."),
+  });
+
+  const deleteClassroom = useMutation({
+    mutationFn: (id: number) => classroomApi.delete(id),
+    onSuccess: () => {
+      setSelectedId(null);
+      setShowDeleteConfirm(false);
+      void client.invalidateQueries({ queryKey: ["classrooms"] });
+      toast.success("Анги танхимыг амжилттай устгалаа.");
+    },
+    onError: () => toast.error("Анги устгахад алдаа гарлаа."),
   });
 
   const approveMutation = useMutation({
@@ -247,6 +259,13 @@ export default function TeacherPortalPage() {
                       <span>Урилгын код: <b className="text-brand-cyan font-mono text-sm">{classroom.invite_code}</b></span>
                       <span className="text-muted-foreground">|</span>
                       <span>{classroom.students_count} сурагч баталгаажсан</span>
+                      <span className="text-muted-foreground">|</span>
+                      <button 
+                        onClick={() => setShowDeleteConfirm(true)}
+                        className="text-rose-500 hover:text-rose-600 font-bold cursor-pointer transition-all flex items-center gap-1 bg-transparent border-0 outline-none p-0"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" /> Анги устгах
+                      </button>
                     </div>
                   </div>
 
@@ -648,6 +667,43 @@ export default function TeacherPortalPage() {
 
         </main>
       </div>
+      {/* DELETE CLASSROOM CONFIRMATION MODAL */}
+      {showDeleteConfirm && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-card w-full max-w-sm rounded-2xl border border-border shadow-xl p-5 space-y-4">
+            <div className="flex items-center justify-between border-b border-border pb-2.5">
+              <h2 className="text-sm font-bold flex items-center gap-1.5 text-rose-500">
+                <Trash2 className="w-4 h-4" />
+                Анги устгах уу?
+              </h2>
+              <button className="h-6 w-6 rounded-md hover:bg-secondary flex items-center justify-center bg-transparent border-0 cursor-pointer text-muted-foreground" onClick={() => setShowDeleteConfirm(false)}>
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              Та <b>{classroom?.name}</b> ангийг устгахдаа итгэлтэй байна уу? Устгасан ангийн сурагчийн түүх, хичээлийн холбоос сэргэхгүйгээр устах болно.
+            </p>
+
+            <div className="flex gap-2 pt-2">
+              <Button 
+                variant="outline" 
+                onClick={() => setShowDeleteConfirm(false)}
+                className="flex-1 h-8 rounded-xl text-xs font-bold"
+              >
+                Цуцлах
+              </Button>
+              <Button 
+                onClick={() => classId && deleteClassroom.mutate(classId)}
+                disabled={deleteClassroom.isPending}
+                className="flex-1 h-8 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs"
+              >
+                {deleteClassroom.isPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : "Устгах"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </RoleGate>
   );
 }

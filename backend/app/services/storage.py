@@ -30,7 +30,9 @@ class MinioStorage:
             settings.MINIO_BUCKET_PROBLEMS,
             settings.MINIO_BUCKET_SUBMISSIONS,
             settings.MINIO_BUCKET_AVATARS,
-            "oj-testcases"
+            "oj-testcases",
+            "oj-private-problems",
+            "oj-workspace-drafts"
         ]
         public_buckets = [
             settings.MINIO_BUCKET_PROBLEMS,

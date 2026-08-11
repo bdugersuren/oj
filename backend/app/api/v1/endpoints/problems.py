@@ -14,8 +14,9 @@ POST   /api/v1/problems/{code}/hints  — Hint нэмэх (teacher / admin)
 
 GET    /api/v1/problems/{code}/stats  — Бодлогын нийт статистик
 """
+import anyio
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 from sqlalchemy.orm import selectinload
@@ -23,7 +24,7 @@ from pydantic import BaseModel, field_validator
 
 from app.core.database import get_db
 from app.core.config import settings
-from app.core.dependencies import get_current_user, require_role
+from app.core.dependencies import get_current_user, require_role, get_current_user_optional
 from app.services.storage import storage_client
 from app.models.user import User, UserRole
 from app.models.problem import Problem, TestCase, ProblemHint, DifficultyLevel, OlympiadScope, DivisionCategory
@@ -73,8 +74,28 @@ class ProblemListItem(BaseModel):
     testcase_count: int = 0
     accepted_count: int = 0
     total_submissions: int = 0
+    solved_status: str = "unsolved"
 
     model_config = {"from_attributes": True}
+
+
+class RunSamplesRequest(BaseModel):
+    language: str
+    source_code: str
+
+class TestCaseResultOut(BaseModel):
+    testcase_id: int
+    status: str
+    time_ms: float
+    memory_kb: float
+    actual_output: Optional[str] = None
+    checker_output: Optional[str] = None
+
+class RunSamplesResponse(BaseModel):
+    status: str
+    time_ms: float
+    memory_kb: float
+    testcases: List[TestCaseResultOut]
 
 
 class ProblemDetail(BaseModel):
@@ -224,7 +245,13 @@ async def list_problems(
     skip:       int                       = Query(0, ge=0),
     limit:      int                       = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
+    # Force visible_only = True for students or unauthenticated users
+    is_privileged = current_user and current_user.role.value in ("teacher", "admin")
+    if not is_privileged:
+        visible_only = True
+
     query = select(Problem)
     if visible_only:
         query = query.where(Problem.is_visible == True)
@@ -245,10 +272,24 @@ async def list_problems(
     result = await db.execute(query)
     problems = result.scalars().all()
 
+    # Хэрэглэгчийн бодсон/оролдсон төлөвийг авах
+    user_status_map = {}
+    if current_user and problems:
+        p_ids = [p.id for p in problems]
+        sub_res = await db.execute(
+            select(Submission.problem_id, Submission.status)
+            .where(Submission.user_id == current_user.id, Submission.problem_id.in_(p_ids))
+        )
+        for pid, status in sub_res.all():
+            if user_status_map.get(pid) != "solved":
+                if status == SubmissionStatus.ACCEPTED:
+                    user_status_map[pid] = "solved"
+                else:
+                    user_status_map[pid] = "attempted"
+
     items = []
     for p in problems:
         stats = await _submission_stats(p.id, db)
-        # Count testcases via separate query (avoid N+1 with selectinload on list)
         tc_count = await db.execute(
             select(func.count()).where(TestCase.problem_id == p.id)
         )
@@ -256,6 +297,7 @@ async def list_problems(
             **p.__dict__,
             "testcase_count":   tc_count.scalar_one() or 0,
             **stats,
+            "solved_status": user_status_map.get(p.id, "unsolved"),
         })
     return items
 
@@ -265,9 +307,14 @@ async def list_problems(
     response_model=ProblemDetail,
     summary="Бодлогын дэлгэрэнгүй мэдээлэл + Sample Testcase + Hints",
 )
-async def get_problem(code: str, db: AsyncSession = Depends(get_db)):
+async def get_problem(
+    code: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
     problem = await _get_problem_or_404(code, db)
-    if not problem.is_visible:
+    is_privileged = current_user and current_user.role.value in ("teacher", "admin")
+    if not problem.is_visible and not is_privileged:
         raise HTTPException(status_code=404, detail="Бодлого олдсонгүй.")
 
     stats = await _submission_stats(problem.id, db)
@@ -716,12 +763,6 @@ async def get_statement_pdf_url(
 ):
     problem = await _get_problem_or_404(code, db)
 
-    if not problem.statement_pdf_path:
-        raise HTTPException(status_code=404, detail="Энэ бодлогод PDF өгүүлбэр байхгүй байна.")
-
-    # MinIO key нь '/oj-problems/pdfs/BF101.pdf' хэлбэртэй ирнэ, бидэнд 'pdfs/BF101.pdf' хэрэгтэй.
-    key = problem.statement_pdf_path.replace(f"/{settings.MINIO_BUCKET_PROBLEMS}/", "")
-
     url = await storage_client.get_presigned_url(
         bucket=settings.MINIO_BUCKET_PROBLEMS,
         key=key
@@ -731,4 +772,555 @@ async def get_statement_pdf_url(
         raise HTTPException(status_code=500, detail="Татах холбоос үүсгэхэд алдаа гарлаа.")
 
     return {"url": url}
+
+
+def parse_simple_yaml(content: str) -> dict:
+    """
+    YAML parser for DMOJ init.yml parsing using PyYAML.
+    """
+    import yaml
+    try:
+        return yaml.safe_load(content) or {}
+    except Exception:
+        return {}
+
+
+@router.post("/upload-package", summary="Нэгдсэн бодлогын ZIP багцыг системд оруулах")
+async def upload_problem_package(
+    code: str,
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_role("teacher", "admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Админ эсвэл багш бодлогын нэгдсэн ZIP файлыг оруулах үеийн endpoint.
+    ZIP файл нь дотроо public/ болон private/ хавтастай байна.
+    """
+    import io
+    import zipfile
+    
+    contents = await file.read()
+    if not zipfile.is_zipfile(io.BytesIO(contents)):
+        raise HTTPException(status_code=400, detail="Илгээсэн файл зөв ZIP архив биш байна.")
+        
+    with zipfile.ZipFile(io.BytesIO(contents)) as z:
+        namelist = z.namelist()
+        
+        # Шаардлагатай файлуудыг баталгаажуулах
+        public_statement_path = next((f for f in namelist if f.endswith("public/statement.md")), None)
+        private_init_path = next((f for f in namelist if f.endswith("private/init.yml")), None)
+        
+        if not public_statement_path:
+            raise HTTPException(status_code=400, detail="Багц дотор public/statement.md олдсонгүй.")
+        if not private_init_path:
+            raise HTTPException(status_code=400, detail="Багц дотор private/init.yml олдсонгүй.")
+            
+        # Бодлогын өгүүлбэрийг унших
+        statement_md = z.read(public_statement_path).decode("utf-8")
+        
+        # init.yml унших
+        init_yml_content = z.read(private_init_path).decode("utf-8")
+        init_cfg = parse_simple_yaml(init_yml_content)
+        
+        # Тохиргоонуудыг авах
+        time_limit = float(init_cfg.get("time_limit", 1.0))
+        memory_limit = int(init_cfg.get("memory_limit", 64))
+        
+        # 1. Нийтийн хандалттай файлуудыг upload-assets рүү хуулах
+        for name in namelist:
+            if "public/" in name and not name.endswith("/"):
+                file_bytes = z.read(name)
+                rel_path = name.split("public/", 1)[1]
+                key = f"{code}/{rel_path}"
+                
+                await storage_client.upload_file(
+                    bucket=settings.MINIO_BUCKET_PROBLEMS,
+                    key=key,
+                    data=io.BytesIO(file_bytes),
+                    length=len(file_bytes)
+                )
+                
+        # 2. Нууцлагдмал файлыг баглаж oj-private-problems рүү хуулах
+        private_zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(private_zip_buffer, "w", zipfile.ZIP_DEFLATED) as pz:
+            for name in namelist:
+                if "private/" in name and not name.endswith("/"):
+                    file_bytes = z.read(name)
+                    rel_path = name.split("private/", 1)[1]
+                    pz.writestr(rel_path, file_bytes)
+                    
+        private_zip_bytes = private_zip_buffer.getvalue()
+        private_key = f"{code}/cases.zip"
+        
+        await storage_client.upload_file(
+            bucket="oj-private-problems",
+            key=private_key,
+            data=io.BytesIO(private_zip_bytes),
+            length=len(private_zip_bytes)
+        )
+        
+        # 3. Өгөгдлийн санд бодлогыг хадгалах / шинэчлэх
+        result = await db.execute(select(Problem).where(Problem.code == code))
+        problem = result.scalar_one_or_none()
+        
+        if not problem:
+            problem = Problem(
+                code=code,
+                title=code,
+                statement_markdown=statement_md,
+                time_limit=time_limit,
+                memory_limit=memory_limit,
+                testcases_zip_key=f"oj-private-problems/{private_key}",
+                created_by_id=current_user.id
+            )
+            db.add(problem)
+        else:
+            problem.statement_markdown = statement_md
+            problem.time_limit = time_limit
+            problem.memory_limit = memory_limit
+            problem.testcases_zip_key = f"oj-private-problems/{private_key}"
+            
+        await db.flush()
+        
+        # Хуучин тест кейсүүдийг устгах
+        await db.execute(
+            TestCase.__table__.delete().where(TestCase.problem_id == problem.id)
+        )
+        
+        # Жишээ оролт/гаралт (Sample testcases)-ийг DB-д хадгалах
+        testcases_list = init_cfg.get("test_cases", [])
+        
+        flat_testcases = []
+        is_nested = len(testcases_list) > 0 and "cases" in testcases_list[0]
+        if is_nested:
+            for subtask in testcases_list:
+                sub_points = int(subtask.get("points", 10))
+                sub_cases = subtask.get("cases", [])
+                for tc in sub_cases:
+                    tc_points = int(tc.get("points", sub_points))
+                    flat_testcases.append({
+                        "in": tc.get("in"),
+                        "out": tc.get("out"),
+                        "points": tc_points,
+                        "sample": tc.get("sample", False)
+                    })
+        else:
+            flat_testcases = testcases_list
+            
+        order_idx = 1
+        for tc in flat_testcases:
+            is_sample = str(tc.get("is_sample", "false")).lower() == "true" or str(tc.get("sample", "false")).lower() == "true"
+            in_file = tc.get("in")
+            out_file = tc.get("out")
+            points = int(tc.get("points", 10))
+            
+            input_data = ""
+            output_data = ""
+            
+            if is_sample and in_file and out_file:
+                in_path = next((f for f in namelist if f.endswith(f"private/cases/{in_file}") or f.endswith(f"private/{in_file}")), None)
+                out_path = next((f for f in namelist if f.endswith(f"private/cases/{out_file}") or f.endswith(f"private/{out_file}")), None)
+                if in_path:
+                    input_data = z.read(in_path).decode("utf-8")
+                if out_path:
+                    output_data = z.read(out_path).decode("utf-8")
+                    
+            db_tc = TestCase(
+                problem_id=problem.id,
+                input_data=input_data if is_sample else None,
+                output_data=output_data if is_sample else None,
+                points=points,
+                order=order_idx,
+                is_sample=is_sample
+            )
+            db.add(db_tc)
+            order_idx += 1
+            
+        await db.commit()
+        
+    return {
+        "status": "success",
+        "message": f"Бодлого '{code}' нэгдсэн багцын дагуу амжилттай үүсэж шинэчлэгдлээ."
+    }
+
+
+@router.get("/{code}/assets/{filename:path}", summary="Бодлогын нийтийн asset/зургийг binary-аар үзэх")
+async def serve_problem_asset(
+    code: str,
+    filename: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+):
+    code = code.upper()
+    problem = await _get_problem_or_404(code, db)
+    is_privileged = current_user and current_user.role.value in ("teacher", "admin")
+    if not problem.is_visible and not is_privileged:
+        raise HTTPException(status_code=404, detail="Бодлого олдсонгүй.")
+        
+    key = f"{code}/assets/{filename}"
+    
+    def _read():
+        try:
+            response = storage_client.client.get_object(settings.MINIO_BUCKET_PROBLEMS, key)
+            data = response.read()
+            response.close()
+            response.release_conn()
+            return data
+        except Exception:
+            raise HTTPException(status_code=404, detail="Asset олдсонгүй.")
+            
+    try:
+        file_bytes = await anyio.to_thread.run_sync(_read)
+        ext = filename.split(".")[-1].lower() if "." in filename else ""
+        content_type = "application/octet-stream"
+        if ext in ("png", "jpg", "jpeg", "gif", "svg", "webp"):
+            content_type = f"image/{'jpeg' if ext in ('jpg', 'jpeg') else ext}"
+        elif ext == "pdf":
+            content_type = "application/pdf"
+            
+        return Response(content=file_bytes, media_type=content_type)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Error serving public asset {key}: {e}")
+        raise HTTPException(status_code=404, detail="Asset олдсонгүй.")
+
+
+@router.post("/{code}/run-samples", response_model=RunSamplesResponse, summary="Бодлогын жишээ тестүүдийг ephemeral байдлаар шүүж хариуг шууд буцаах (баазад илгээлт болж орохгүй)")
+async def run_samples(
+    code: str,
+    req: RunSamplesRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    code = code.upper()
+    problem = await _get_problem_or_404(code, db)
+    
+    # 1. Жишээ тестүүдийг баазаас авах
+    tc_result = await db.execute(
+        select(TestCase)
+        .where(TestCase.problem_id == problem.id, TestCase.is_sample == True)
+        .order_by(TestCase.order.asc())
+    )
+    db_samples = tc_result.scalars().all()
+    
+    tc_list = []
+    for s in db_samples:
+        tc_list.append({
+            "id": s.id,
+            "input_data": s.input_data or "",
+            "output_data": s.output_data or "",
+            "points": s.points
+        })
+        
+    if not tc_list:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Энэ бодлогод жишээ тест оруулаагүй байна."
+        )
+        
+    # Checker унших
+    checker_code = None
+    checker_type = "default"
+    if getattr(problem, 'testcases_zip_key', None):
+        from pathlib import Path
+        local_dir = Path("/problems") / f"oj-{problem.code}"
+        chk_cpp = local_dir / "checker.cpp"
+        if chk_cpp.exists():
+            try:
+                checker_code = chk_cpp.read_text(encoding="utf-8")
+                checker_type = "cpp"
+            except Exception:
+                pass
+                
+    # 2. Local subprocess ашиглан шүүх
+    from app.services.local_judge import LocalSubprocessJudge
+    
+    def run_grade():
+        return LocalSubprocessJudge.grade_submission(
+            language=req.language,
+            source_code=req.source_code,
+            test_cases=tc_list,
+            time_limit_sec=problem.time_limit,
+            memory_limit_mb=problem.memory_limit,
+            checker_code=checker_code,
+            checker_type=checker_type
+        )
+        
+    verdict = await anyio.to_thread.run_sync(run_grade)
+    
+    # 3. Үр дүнг буцаах
+    return {
+        "status": verdict.get("status", "RTE"),
+        "time_ms": verdict.get("time_ms", 0.0),
+        "memory_kb": verdict.get("memory_kb", 0.0),
+        "testcases": [
+            {
+                "testcase_id": tc_res.get("testcase_id"),
+                "status": tc_res.get("status"),
+                "time_ms": tc_res.get("time_ms", 0.0),
+                "memory_kb": tc_res.get("memory_kb", 0.0),
+                "actual_output": tc_res.get("actual_output"),
+                "checker_output": tc_res.get("checker_output"),
+            }
+            for tc_res in verdict.get("test_results", [])
+        ]
+    }
+
+
+@router.get("/{code}/export", summary="Бодлогыг зөөврийн ZIP багц болгон экспортлох (Teacher / Admin)")
+async def export_problem(
+    code: str,
+    current_user: User = Depends(require_role("teacher", "admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    code = code.upper()
+    problem = await _get_problem_or_404(code, db)
+    
+    import io, zipfile, json
+    from fastapi.responses import StreamingResponse
+    
+    # 1. Create a zip file in memory
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        prob_meta = {
+            "title": problem.title,
+            "code": problem.code,
+            "time_limit": problem.time_limit,
+            "memory_limit": problem.memory_limit,
+            "points": problem.points,
+            "xp_reward": problem.xp_reward,
+            "difficulty": problem.difficulty.value,
+            "topic": problem.topic,
+            "olympiad_scope": problem.olympiad_scope.value,
+            "division": problem.division.value,
+            "olympiad_year": problem.olympiad_year,
+            "source_citation": problem.source_citation,
+            "hints": [
+                {
+                    "level": h.level,
+                    "title": h.title,
+                    "hint_text": h.hint_text,
+                    "xp_penalty": h.xp_penalty
+                }
+                for h in problem.hints
+            ],
+            "test_cases": [
+                {
+                    "order": tc.order,
+                    "points": tc.points,
+                    "is_sample": tc.is_sample,
+                    "input_file": f"testcases/{tc.order}.in",
+                    "output_file": f"testcases/{tc.order}.out"
+                }
+                for tc in problem.test_cases
+            ]
+        }
+        
+        # Write metadata & statement
+        z.writestr("problem.json", json.dumps(prob_meta, ensure_ascii=False, indent=2))
+        z.writestr("statement.md", problem.statement_markdown or "")
+        
+        # Write checker.cpp if exists
+        from pathlib import Path
+        local_dir = Path("/problems") / f"oj-{problem.code}"
+        chk_cpp = local_dir / "checker.cpp"
+        if chk_cpp.exists():
+            z.writestr("checker.cpp", chk_cpp.read_text(encoding="utf-8"))
+                
+        # Write test cases
+        for tc in problem.test_cases:
+            z.writestr(f"testcases/{tc.order}.in", tc.input_data or "")
+            z.writestr(f"testcases/{tc.order}.out", tc.output_data or "")
+            
+        # Download assets from S3 and add to zip
+        try:
+            objects = storage_client.client.list_objects(
+                settings.MINIO_BUCKET_PROBLEMS,
+                prefix=f"{problem.code}/assets/",
+                recursive=True
+            )
+            for obj in objects:
+                response = storage_client.client.get_object(settings.MINIO_BUCKET_PROBLEMS, obj.object_name)
+                data = response.read()
+                response.close()
+                response.release_conn()
+                
+                rel_name = obj.object_name.replace(f"{problem.code}/assets/", "assets/")
+                z.writestr(rel_name, data)
+        except Exception:
+            pass
+            
+    zip_buffer.seek(0)
+    
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename=problem_{problem.code}.zip"
+        }
+    )
+
+
+@router.post("/import", response_model=ProblemListItem, summary="Бодлогыг ZIP файлыг уншиж импортлох (давхардсан код таньж suffix нэмэх)")
+async def import_problem(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_role("teacher", "admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    import io, zipfile, json
+    
+    contents = await file.read()
+    zip_buffer = io.BytesIO(contents)
+    
+    try:
+        with zipfile.ZipFile(zip_buffer, "r") as z:
+            if "problem.json" not in z.namelist():
+                raise HTTPException(status_code=400, detail="ZIP багцад 'problem.json' файл олдсонгүй.")
+                
+            prob_meta = json.loads(z.read("problem.json").decode("utf-8"))
+            
+            statement_markdown = ""
+            if "statement.md" in z.namelist():
+                statement_markdown = z.read("statement.md").decode("utf-8")
+            elif "statement_markdown" in prob_meta:
+                statement_markdown = prob_meta["statement_markdown"]
+            else:
+                statement_markdown = "Бодлогын өгүүлбэр байхгүй байна."
+                
+            # Conflict Resolution
+            base_code = prob_meta.get("code", "IMPORTED").strip().upper()
+            unique_code = base_code
+            counter = 1
+            while True:
+                existing = await db.execute(select(Problem).where(Problem.code == unique_code))
+                if not existing.scalar_one_or_none():
+                    break
+                unique_code = f"{base_code}_{counter}"
+                counter += 1
+                
+            # Create Problem
+            new_problem = Problem(
+                code=unique_code,
+                title=prob_meta.get("title", f"Импортлогдсон бодлого ({unique_code})"),
+                statement_markdown=statement_markdown,
+                statement_pdf_path=prob_meta.get("statement_pdf_path"),
+                time_limit=float(prob_meta.get("time_limit", 1.0)),
+                memory_limit=int(prob_meta.get("memory_limit", 64)),
+                points=int(prob_meta.get("points", 10)),
+                xp_reward=int(prob_meta.get("xp_reward", 20)),
+                difficulty=DifficultyLevel(prob_meta.get("difficulty", "Bronze")),
+                topic=prob_meta.get("topic", "Brute Force"),
+                olympiad_scope=OlympiadScope(prob_meta.get("olympiad_scope", "Олимпиад биш / Сургалт")),
+                division=DivisionCategory(prob_meta.get("division", "Ерөнхий")),
+                olympiad_year=prob_meta.get("olympiad_year"),
+                source_citation=prob_meta.get("source_citation"),
+                created_by_id=current_user.id
+            )
+            
+            db.add(new_problem)
+            await db.commit()
+            await db.refresh(new_problem)
+            
+            # Upload assets/ to MinIO
+            for file_path in z.namelist():
+                if file_path.startswith("assets/") and not file_path.endswith("/"):
+                    data = z.read(file_path)
+                    filename = file_path.replace("assets/", "")
+                    dest_key = f"{unique_code}/assets/{filename}"
+                    
+                    def _upload():
+                        import io as pyio
+                        storage_client.client.put_object(
+                            settings.MINIO_BUCKET_PROBLEMS,
+                            dest_key,
+                            pyio.BytesIO(data),
+                            length=len(data)
+                        )
+                    await anyio.to_thread.run_sync(_upload)
+            
+            if unique_code != base_code:
+                statement_markdown = statement_markdown.replace(
+                    f"/problems/{base_code}/assets/",
+                    f"/problems/{unique_code}/assets/"
+                )
+                new_problem.statement_markdown = statement_markdown
+                await db.commit()
+                
+            # Import checker.cpp if exists
+            if "checker.cpp" in z.namelist():
+                checker_data = z.read("checker.cpp").decode("utf-8")
+                def _write_checker():
+                    from pathlib import Path
+                    local_dir = Path("/problems") / f"oj-{unique_code}"
+                    local_dir.mkdir(parents=True, exist_ok=True)
+                    (local_dir / "checker.cpp").write_text(checker_data, encoding="utf-8")
+                await anyio.to_thread.run_sync(_write_checker)
+                
+            # Create test cases
+            for tc_meta in prob_meta.get("test_cases", []):
+                input_file = tc_meta.get("input_file")
+                output_file = tc_meta.get("output_file")
+                
+                input_data = ""
+                output_data = ""
+                
+                if input_file and input_file in z.namelist():
+                    input_data = z.read(input_file).decode("utf-8", errors="replace")
+                if output_file and output_file in z.namelist():
+                    output_data = z.read(output_file).decode("utf-8", errors="replace")
+                    
+                new_tc = TestCase(
+                    problem_id=new_problem.id,
+                    input_data=input_data,
+                    output_data=output_data,
+                    points=int(tc_meta.get("points", 10)),
+                    order=int(tc_meta.get("order", 1)),
+                    is_sample=bool(tc_meta.get("is_sample", False))
+                )
+                db.add(new_tc)
+                
+            # Create hints
+            for hint_meta in prob_meta.get("hints", []):
+                new_hint = ProblemHint(
+                    problem_id=new_problem.id,
+                    level=int(hint_meta.get("level", 1)),
+                    title=hint_meta.get("title", ""),
+                    hint_text=hint_meta.get("hint_text", ""),
+                    xp_penalty=int(hint_meta.get("xp_penalty", 5))
+                )
+                db.add(new_hint)
+                
+            await db.commit()
+            
+            tc_count = len(prob_meta.get("test_cases", []))
+            
+            return {
+                "id": new_problem.id,
+                "code": new_problem.code,
+                "title": new_problem.title,
+                "points": new_problem.points,
+                "xp_reward": new_problem.xp_reward,
+                "difficulty": new_problem.difficulty,
+                "topic": new_problem.topic,
+                "time_limit": new_problem.time_limit,
+                "memory_limit": new_problem.memory_limit,
+                "olympiad_scope": new_problem.olympiad_scope,
+                "division": new_problem.division,
+                "olympiad_year": new_problem.olympiad_year,
+                "source_citation": new_problem.source_citation,
+                "is_visible": new_problem.is_visible,
+                "testcase_count": tc_count,
+                "accepted_count": 0,
+                "total_submissions": 0,
+                "solved_status": "unsolved"
+            }
+            
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Хүчингүй ZIP файл байна.")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Error importing problem package: {e}")
+        raise HTTPException(status_code=500, detail=f"Бодлого импортлоход алдаа гарлаа: {str(e)}")
 

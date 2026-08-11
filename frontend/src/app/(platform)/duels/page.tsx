@@ -14,6 +14,7 @@ import { Progress } from "@/components/ui/progress";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { useTheme } from "next-themes";
 import toast from "react-hot-toast";
+import { progressApi } from "@/lib/api/progress";
 
 export default function DuelsPage() {
   const { resolvedTheme } = useTheme();
@@ -25,6 +26,33 @@ export default function DuelsPage() {
   const [oppTestsPassed, setOppTestsPassed] = useState<number>(2);
   const [duelFinished, setDuelFinished] = useState<boolean>(false);
   const [winner, setWinner] = useState<string | null>(null);
+
+  const [myUsername, setMyUsername] = useState<string>("bold_coder");
+  const [myElo, setMyElo] = useState<number>(1200);
+  const [oppElo, setOppElo] = useState<number>(1200);
+  const [eloChange, setEloChange] = useState<number>(0);
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+
+  useEffect(() => {
+    // Fetch my profile to get actual Elo
+    progressApi.me()
+      .then((data) => {
+        setMyUsername(data.username);
+        setMyElo(data.elo_rating);
+      })
+      .catch((err) => {
+        console.error("Failed to fetch progress profile:", err);
+      });
+
+    // Fetch algo_master's profile to get actual opponent Elo
+    progressApi.byUsername("algo_master")
+      .then((data) => {
+        setOppElo(data.elo_rating);
+      })
+      .catch((err) => {
+        console.error("Opponent not found:", err);
+      });
+  }, []);
 
   const [code, setCode] = useState<string>(`#include <iostream>
 using namespace std;
@@ -71,11 +99,27 @@ int main() {
     return () => clearTimeout(oppTimer);
   }, [duelFinished]);
 
-  const handleSubmitDuel = () => {
-    setMyTestsPassed(5);
-    setDuelFinished(true);
-    setWinner("my");
-    toast.success("🎉 БАЯР ХҮРГЭЕ! Та өрсөлдөгчөөсөө түрүүлж 5/5 давж яллаа! +50 Duel Elo");
+  const handleSubmitDuel = async () => {
+    setIsSubmitting(true);
+    try {
+      setMyTestsPassed(5);
+      const res = await progressApi.resolveDuel("algo_master", "win");
+      setWinner("my");
+      setDuelFinished(true);
+      setEloChange(res.my_change);
+      setMyElo(res.my_new_rating);
+      setOppElo(res.opponent_new_rating);
+      toast.success(`🎉 БАЯР ХҮРГЭЕ! Та өрсөлдөгчөөсөө түрүүлж 5/5 давж яллаа! +${res.my_change} Duel Elo`);
+    } catch (err: any) {
+      console.error(err);
+      toast.error(err.message || "Дуэлийн үр дүнг бүртгэхэд алдаа гарлаа.");
+      // Fallback
+      setWinner("my");
+      setDuelFinished(true);
+      setEloChange(32);
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const formatTime = (secs: number) => {
@@ -128,8 +172,8 @@ int main() {
             ТА
           </div>
           <div>
-            <div className="text-xs font-black text-foreground">bold_coder (Та)</div>
-            <div className="text-[11px] text-brand-cyan font-bold">1,840 Elo · {myTestsPassed}/5 Тест давсан</div>
+            <div className="text-xs font-black text-foreground">{myUsername} (Та)</div>
+            <div className="text-[11px] text-brand-cyan font-bold">{myElo} Elo · {myTestsPassed}/5 Тест давсан</div>
             <Progress value={(myTestsPassed / 5) * 100} className="h-1.5 w-36 mt-1 bg-secondary" />
           </div>
         </div>
@@ -142,8 +186,8 @@ int main() {
         {/* Player 2 (Opponent) */}
         <div className="flex items-center justify-end gap-3 flex-1 text-right">
           <div>
-            <div className="text-xs font-black text-foreground">temuulen_pro (Өрсөлдөгч)</div>
-            <div className="text-[11px] text-purple-400 font-bold">{oppTestsPassed}/5 Тест давсан · 1,815 Elo</div>
+            <div className="text-xs font-black text-foreground">algo_master (Өрсөлдөгч)</div>
+            <div className="text-[11px] text-purple-400 font-bold">{oppTestsPassed}/5 Тест давсан · {oppElo} Elo</div>
             <Progress value={(oppTestsPassed / 5) * 100} className="h-1.5 w-36 mt-1 ml-auto bg-secondary" />
           </div>
           <div className="w-10 h-10 rounded-2xl bg-purple-600 flex items-center justify-center text-white font-black text-sm shadow-md">
@@ -190,10 +234,18 @@ int main() {
             <Button
               size="sm"
               onClick={handleSubmitDuel}
-              disabled={duelFinished}
+              disabled={duelFinished || isSubmitting}
               className="h-7 text-xs gradient-brand text-white border-0 font-bold gap-1 rounded-lg shadow-md shadow-brand-cyan/20 cursor-pointer"
             >
-              <Send className="w-3 h-3" /> Код Илгээх (Submit)
+              {isSubmitting ? (
+                <>
+                  <RefreshCw className="w-3 h-3 animate-spin" /> Уншиж байна...
+                </>
+              ) : (
+                <>
+                  <Send className="w-3 h-3" /> Код Илгээх (Submit)
+                </>
+              )}
             </Button>
           </div>
 
@@ -237,7 +289,7 @@ int main() {
             <div className="glass rounded-2xl p-4 border border-border flex items-center justify-around text-xs font-bold bg-card/60">
               <div>
                 <div className="text-[10px] text-muted-foreground uppercase">Elo Rating</div>
-                <div className="text-base font-black text-emerald-500">+50 Elo</div>
+                <div className="text-base font-black text-emerald-500">+{eloChange} Elo</div>
               </div>
               <div className="h-8 w-px bg-border" />
               <div>

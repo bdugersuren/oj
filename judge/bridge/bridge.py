@@ -16,7 +16,42 @@ from dmoj.result import Result
 
 LOG = logging.getLogger("oj.dmoj_bridge")
 PROBLEM_ROOT = Path("/problems")
-LANGUAGES = {"cpp": "CPP17", "c": "C11", "python3": "PY3", "java": "JAVA17", "pascal": "PASCAL"}
+LANGUAGES = {
+    # C++
+    "g++20":   "CPP20",
+    "g++23":   "CPP23",
+    "g++17":   "CPP17",
+    "g++14":   "CPP14",
+    "g++11":   "CPP11",
+    "cpp":     "CPP17",
+    "c++":     "CPP17",
+    "clang++": "CLPP17",
+    # C
+    "gcc":     "C11",
+    "c":       "C11",
+    "gcc11":   "C11",
+    "gcc23":   "C23",
+    "clang":   "CLANG",
+    # Python
+    "python3": "PY3",
+    "pypy3":   "PYPY3",
+    "python":  "PY2",
+    "pypy":    "PYPY",
+    # Java
+    "java":    "JAVA",
+    "java8":   "JAVA8",
+    # Pascal
+    "pascal":  "PAS",
+    "fpc":     "PAS",
+    # Go
+    "go":      "GO",
+    # Rust
+    "cargo":   "RUST",
+    # JavaScript
+    "node":    "NODEJS",
+    # C#
+    "mono-csc": "MONOCS",
+}
 STATUS_PRIORITY = ((Result.TLE, "TLE"), (Result.MLE, "MLE"), (Result.RTE, "RTE"), (Result.WA, "WA"))
 
 
@@ -67,7 +102,7 @@ class CapturePackets:
 class DMOJAdapter:
     def __init__(self) -> None:
         # DMOJ loads its runtime paths and problem-storage configuration from this file.
-        sys.argv = ["oj-dmoj-bridge", "--config", "/judge/judge.yml", "--skip-self-test", "--no-ansi"]
+        sys.argv = ["oj-dmoj-bridge", "--config", "/tmp/merged_judge.yml", "--skip-self-test", "--no-ansi"]
         judgeenv.load_env(cli=True)
         executors.load_executors()
         contrib.load_contrib_modules()
@@ -130,8 +165,16 @@ class DMOJAdapter:
         with self.lock:
             self.packets.reset()
             directory: Path | None = None
+            testcase_ids: list[int] = []
             try:
-                problem_id, testcase_ids, directory = self._write_problem(payload)
+                # Check if testcases are supplied via socket payload (legacy flow)
+                if "testcases" in payload:
+                    problem_id, testcase_ids, directory = self._write_problem(payload)
+                else:
+                    # Zip-cached pre-extracted flow
+                    problem_id = f"oj-{payload['problem']}"
+                    judgeenv.clear_problem_dirs_cache()
+
                 self.judge.begin_grading(Submission(
                     int(payload["id"]), problem_id, language, str(payload["source"]),
                     float(payload.get("time_limit", 1.0)), int(payload.get("memory_limit_mb", 64)) * 1024,
@@ -144,7 +187,7 @@ class DMOJAdapter:
                 test_results = []
                 for item in self.packets.results:
                     position = item.pop("position")
-                    item["testcase_id"] = testcase_ids[position - 1]
+                    item["testcase_id"] = testcase_ids[position - 1] if testcase_ids else position
                     test_results.append(item)
                 statuses = {item["status"] for item in test_results}
                 status = next((code for _flag, code in STATUS_PRIORITY if code in statuses), "AC")
@@ -161,7 +204,7 @@ class DMOJAdapter:
             finally:
                 if directory:
                     shutil.rmtree(directory, ignore_errors=True)
-                    judgeenv.clear_problem_dirs_cache()
+                judgeenv.clear_problem_dirs_cache()
 
 
 class Handler(socketserver.BaseRequestHandler):

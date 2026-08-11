@@ -228,3 +228,27 @@ async def reindex_approved_curated_data(
         count += 1
     await db.commit()
     return {"message": f"Бүх {count} APPROVED материалуудыг дахин векторжуулахаар дараалалд орууллаа."}
+
+
+@router.delete("/delete/{id}", status_code=status.HTTP_204_NO_CONTENT, summary="RAG материалыг бааз болон Qdrant-аас бүрэн устгах (зөвхөн Admin)")
+async def delete_curated_data(
+    id: int,
+    current_user: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(select(TopicDataPool).where(TopicDataPool.id == id))
+    data_entry = result.scalar_one_or_none()
+    if not data_entry:
+        raise HTTPException(status_code=404, detail="Материал олдсонгүй.")
+        
+    # Remove from Qdrant if indexed
+    if data_entry.qdrant_point_id:
+        try:
+            from app.services.qdrant_service import qdrant_service
+            qdrant_service.delete_document(data_entry.qdrant_point_id)
+        except Exception as e:
+            logger.error(f"Failed to delete point from Qdrant: {e}")
+
+    await db.delete(data_entry)
+    await db.commit()
+    return None

@@ -2,6 +2,9 @@
 # runtimes image only supplies language runtimes; it does not contain `dmoj`.
 FROM dmoj/runtimes-tier3:latest
 
+# Install testlib.h globally for custom checkers
+RUN curl -fsSL "https://raw.githubusercontent.com/MikeMirzayanov/testlib/master/testlib.h" -o /usr/include/testlib.h
+
 ARG DMOJ_REF=master
 
 RUN mkdir /judge /problems /app && \

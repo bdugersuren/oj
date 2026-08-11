@@ -202,9 +202,14 @@ export default function EditProblemPage() {
               Үндсэн тохиргоо, өгүүлбэр, тест кэйсүүд болон шаталсан зөвлөмжүүд
             </p>
           </div>
-          <Link href={`/teacher/problems/${code}/testcases`} className={buttonVariants({ variant: "outline", className: "rounded-xl border-white/10 hover:bg-white/5 text-xs font-bold shrink-0" })}>
-            <Layers className="w-4 h-4 mr-2" /> Тест кэйс удирдлага
-          </Link>
+          <div className="flex items-center gap-2">
+            <Link href={`/teacher/problems/${code}/workspace`} className={buttonVariants({ className: "rounded-xl bg-brand-cyan hover:bg-brand-cyan/85 text-black text-xs font-bold shrink-0" })}>
+              <Sparkles className="w-4 h-4 mr-2" /> Workspace (Polygon)
+            </Link>
+            <Link href={`/teacher/problems/${code}/testcases`} className={buttonVariants({ variant: "outline", className: "rounded-xl border-white/10 hover:bg-white/5 text-xs font-bold shrink-0" })}>
+              <Layers className="w-4 h-4 mr-2" /> Тест кэйс удирдлага
+            </Link>
+          </div>
         </div>
 
         {/* Tabs */}

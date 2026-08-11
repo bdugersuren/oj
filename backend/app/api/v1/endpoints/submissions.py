@@ -32,6 +32,7 @@ class SubmissionCreate(BaseModel):
     problem_code: str
     language:     str       # "cpp", "python3", "java", "c"
     source_code:  str
+    is_sample_test: bool = False
 
     class Config:
         json_schema_extra = {
@@ -50,6 +51,7 @@ class JudgeResultOut(BaseModel):
     time_ms: float
     memory_kb: float
     output_log: Optional[str] = None
+    actual_output: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -63,6 +65,7 @@ class SubmissionOut(BaseModel):
     time_ms: float
     memory_kb: float
     submitted_at: datetime
+    source_code: str
     judge_results: List[JudgeResultOut] = []
 
     model_config = {"from_attributes": True}
@@ -84,12 +87,42 @@ class SubmissionListItem(BaseModel):
 # ─── Supported Languages ──────────────────────────────────────────────────────
 
 SUPPORTED_LANGUAGES = {
-    "cpp":     "C++17",
-    "c":       "C11",
+    # C++ versions
+    "g++20":   "C++20 (GCC)",
+    "g++23":   "C++23 (GCC)",
+    "g++17":   "C++17 (GCC)",
+    "g++14":   "C++14 (GCC)",
+    "g++11":   "C++11 (GCC)",
+    "cpp":     "C++17 (GCC)",
+    "c++":     "C++17 (GCC)",
+    "clang++": "C++17 (Clang)",
+    # C versions
+    "gcc":     "C11 (GCC)",
+    "c":       "C11 (GCC)",
+    "gcc11":   "C11 (GCC)",
+    "gcc23":   "C23 (GCC)",
+    "clang":   "C (Clang)",
+    # Python versions
     "python3": "Python 3",
-    "java":    "Java 17",
-    "pascal":  "Pascal",
+    "pypy3":   "PyPy 3",
+    "python":  "Python 2",
+    "pypy":    "PyPy 2",
+    # Java versions
+    "java":    "Java 17/21/25",
+    "java8":   "Java 8",
+    # Pascal
+    "pascal":  "Pascal (FPC)",
+    "fpc":     "Free Pascal",
+    # Go
+    "go":      "Go",
+    # Rust
+    "cargo":   "Rust (Cargo)",
+    # JavaScript
+    "node":    "JavaScript (Node.js)",
+    # C#
+    "mono-csc": "C# (Mono)",
 }
+
 
 
 # ─── POST /submissions ────────────────────────────────────────────────────────
@@ -113,10 +146,14 @@ async def submit_code(
 
     # Бодлого хайх
     p_result = await db.execute(
-        select(Problem).where(Problem.code == payload.problem_code.upper(), Problem.is_visible == True)
+        select(Problem).where(Problem.code == payload.problem_code.upper())
     )
     problem = p_result.scalar_one_or_none()
     if not problem:
+        raise HTTPException(status_code=404, detail="Бодлого олдсонгүй.")
+
+    is_privileged = current_user.role.value in ("teacher", "admin")
+    if not problem.is_visible and not is_privileged:
         raise HTTPException(status_code=404, detail="Бодлого олдсонгүй.")
 
     # Source code хэмжээ шалгах (100KB max)
@@ -133,17 +170,244 @@ async def submit_code(
         score=0,
         time_ms=0.0,
         memory_kb=0.0,
+        is_sample_test=payload.is_sample_test,
     )
     db.add(sub)
     await db.commit()
     await db.refresh(sub)
 
-    # Celery Task Queue-д оруулах
-    celery_app.send_task(
-        "app.workers.judge_worker.execute_submission",
-        args=[sub.id],
-        queue="judge_queue",
-    )
+    # ── Local Sandbox эсвэл DMOJ Bridge-ээр шүүх ──
+    from app.core.config import settings
+    from app.services.local_judge import LocalSubprocessJudge
+    from app.models.problem import TestCase
+    import os
+    
+    enable_judge = os.getenv("ENABLE_JUDGE", "false").lower() == "true"
+    
+    if payload.is_sample_test or not enable_judge:
+        # DB-ээс тестүүд авах
+        if payload.is_sample_test:
+            tc_result = await db.execute(
+                select(TestCase)
+                .where(TestCase.problem_id == problem.id, TestCase.is_sample == True)
+                .order_by(TestCase.order)
+            )
+            test_cases = tc_result.scalars().all()
+        else:
+            tc_result = await db.execute(
+                select(TestCase)
+                .where(TestCase.problem_id == problem.id)
+                .order_by(TestCase.order)
+            )
+            test_cases = tc_result.scalars().all()
+            
+        # Дискнээс оролт/гаралтын файлуудыг сэргээж унших (хэрэв DB-д None байвал)
+        from app.services.local_judge import LocalSubprocessJudge
+        test_cases = LocalSubprocessJudge.resolve_testcase_data_from_disk(
+            problem_code=problem.code,
+            testcases_zip_key=getattr(problem, "testcases_zip_key", None),
+            test_cases=list(test_cases)
+        )
+            
+        # RUNNING төлөв рүү шилжих
+        sub.status = SubmissionStatus.RUNNING
+        await db.commit()
+        await db.refresh(sub)
+        
+        tc_list = [
+            {"id": tc.id, "input_data": tc.input_data or "", "output_data": tc.output_data or "", "points": tc.points}
+            for tc in test_cases
+        ]
+        
+        # FastAPI thread-pool дотор ажиллуулах
+        import anyio
+        def run_grade():
+            nonlocal tc_list
+            checker_code = None
+            checker_type = None
+            
+            # Хэрэв DB-д тест кэйс байхгүй боловч cases.zip байвал
+            if not tc_list and getattr(problem, 'testcases_zip_key', None):
+                from app.workers.judge_worker import _ensure_problem_testcases
+                from pathlib import Path
+                from app.api.v1.endpoints.problems import parse_simple_yaml
+                
+                try:
+                    _ensure_problem_testcases(problem.code, problem.testcases_zip_key)
+                    local_dir = Path("/problems") / f"oj-{problem.code}"
+                    init_file = local_dir / "init.yml"
+                    
+                    if init_file.exists():
+                        init_cfg = parse_simple_yaml(init_file.read_text(encoding="utf-8"))
+                        testcases_cfg = init_cfg.get("test_cases", [])
+                        
+                        is_nested = len(testcases_cfg) > 0 and "cases" in testcases_cfg[0]
+                        if is_nested:
+                            for s_idx, subtask in enumerate(testcases_cfg, start=1):
+                                sub_points = int(subtask.get("points", 10))
+                                sub_cases_cfg = subtask.get("cases", [])
+                                sub_cases = []
+                                
+                                for idx, tc in enumerate(sub_cases_cfg, start=1):
+                                    in_file = tc.get("in")
+                                    out_file = tc.get("out")
+                                    
+                                    in_path = local_dir / in_file if in_file else None
+                                    out_path = local_dir / out_file if out_file else None
+                                    if in_path and not in_path.exists():
+                                        in_path = local_dir / "cases" / in_file
+                                    if out_path and not out_path.exists():
+                                        out_path = local_dir / "cases" / out_file
+                                        
+                                    input_data = ""
+                                    output_data = ""
+                                    if in_path and in_path.exists():
+                                        input_data = in_path.read_text(encoding="utf-8", errors="replace")
+                                    if out_path and out_path.exists():
+                                        output_data = out_path.read_text(encoding="utf-8", errors="replace")
+                                        
+                                    sub_cases.append({
+                                        "id": (s_idx * 100) + idx,
+                                        "input_data": input_data,
+                                        "output_data": output_data
+                                    })
+                                
+                                tc_list.append({
+                                    "subtask_id": s_idx,
+                                    "points": sub_points,
+                                    "cases": sub_cases
+                                })
+                        else:
+                            for idx, tc in enumerate(testcases_cfg, start=1):
+                                in_file = tc.get("in")
+                                out_file = tc.get("out")
+                                points = int(tc.get("points", 10))
+                                
+                                in_path = local_dir / in_file if in_file else None
+                                out_path = local_dir / out_file if out_file else None
+                                if in_path and not in_path.exists():
+                                    in_path = local_dir / "cases" / in_file
+                                if out_path and not out_path.exists():
+                                    out_path = local_dir / "cases" / out_file
+                                    
+                                input_data = ""
+                                output_data = ""
+                                if in_path and in_path.exists():
+                                    input_data = in_path.read_text(encoding="utf-8", errors="replace")
+                                if out_path and out_path.exists():
+                                    output_data = out_path.read_text(encoding="utf-8", errors="replace")
+                                    
+                                tc_list.append({
+                                    "id": idx,
+                                    "input_data": input_data,
+                                    "output_data": output_data,
+                                    "points": points
+                                })
+                except Exception:
+                    pass
+            
+            # Checker унших
+            if getattr(problem, 'testcases_zip_key', None):
+                from pathlib import Path
+                local_dir = Path("/problems") / f"oj-{problem.code}"
+                chk_cpp = local_dir / "checker.cpp"
+                if chk_cpp.exists():
+                    try:
+                        checker_code = chk_cpp.read_text(encoding="utf-8")
+                        checker_type = "cpp"
+                    except Exception:
+                        pass
+                        
+            return LocalSubprocessJudge.grade_submission(
+                language=sub.language,
+                source_code=sub.source_code,
+                test_cases=tc_list,
+                time_limit_sec=problem.time_limit,
+                memory_limit_mb=problem.memory_limit,
+                checker_code=checker_code,
+                checker_type=checker_type
+            )
+        verdict = await anyio.to_thread.run_sync(run_grade)
+        
+        # Дүнгүүдийг шинэчлэх
+        status_map = {
+            "AC":  SubmissionStatus.ACCEPTED,
+            "WA":  SubmissionStatus.WRONG_ANSWER,
+            "TLE": SubmissionStatus.TIME_LIMIT,
+            "MLE": SubmissionStatus.MEMORY_LIMIT,
+            "RTE": SubmissionStatus.RUNTIME_ERROR,
+            "CE":  SubmissionStatus.COMPILATION_ERROR,
+        }
+        
+        sub.status = status_map.get(verdict.get("status", "RTE"), SubmissionStatus.RUNTIME_ERROR)
+        sub.score = verdict.get("score", 0)
+        sub.time_ms = verdict.get("time_ms", 0.0)
+        sub.memory_kb = verdict.get("memory_kb", 0.0)
+        sub.error_log = verdict.get("error_log")
+        
+        # Хуучин дүн байвал цэвэрлэх
+        from sqlalchemy import delete
+        await db.execute(delete(JudgeResult).where(JudgeResult.submission_id == sub.id))
+        
+        # Жишээ тестүүдийн ID-г авах
+        sample_tc_result = await db.execute(
+            select(TestCase.id)
+            .where(TestCase.problem_id == problem.id, TestCase.is_sample == True)
+        )
+        sample_tc_ids = set(sample_tc_result.scalars().all())
+        
+        for tc_res in verdict.get("test_results", []):
+            tc_id = tc_res.get("testcase_id", 0)
+            # Зөвхөн жишээ тест эсвэл жишээ ажиллуулах горимд гаралт хадгална
+            save_actual = tc_res.get("actual_output") if (tc_id in sample_tc_ids or sub.is_sample_test) else None
+            
+            jr = JudgeResult(
+                submission_id=sub.id,
+                testcase_id=tc_id,
+                status=status_map.get(tc_res.get("status", "WA"), SubmissionStatus.WRONG_ANSWER),
+                time_ms=tc_res.get("time_ms", 0.0),
+                memory_kb=tc_res.get("memory_kb", 0.0),
+                output_log=tc_res.get("checker_output"),
+                actual_output=save_actual
+            )
+            db.add(jr)
+            
+        await db.commit()
+        await db.refresh(sub)
+        
+        # Redis Pub/Sub-д цацах (websocket)
+        try:
+            import redis, json
+            r = redis.from_url(settings.REDIS_URL, decode_responses=True)
+            payload_redis = {
+                "submission_id": sub.id,
+                "status": sub.status.value,
+                "score": sub.score,
+                "time_ms": sub.time_ms,
+                "memory_kb": sub.memory_kb,
+                "judge_results": [
+                    {
+                        "id": jr.id,
+                        "testcase_id": jr.testcase_id,
+                        "status": jr.status.value,
+                        "time_ms": jr.time_ms,
+                        "memory_kb": jr.memory_kb,
+                        "output_log": jr.output_log,
+                        "actual_output": jr.actual_output
+                    }
+                    for jr in sorted(sub.judge_results, key=lambda r: r.id)
+                ]
+            }
+            r.publish(f"submission:{sub.id}", json.dumps(payload_redis))
+        except Exception:
+            pass
+    else:
+        # Celery Judge Queue-д оруулах
+        celery_app.send_task(
+            "app.workers.judge_worker.execute_submission",
+            args=[sub.id],
+            queue="judge_queue",
+        )
 
     return {
         "submission_id": sub.id,
@@ -181,6 +445,161 @@ async def get_submission(
     p_result = await db.execute(select(Problem).where(Problem.id == sub.problem_id))
     problem = p_result.scalar_one_or_none()
 
+    # Build batches from init.yml if it exists
+    batches = []
+    is_batched = False
+    
+    if problem:
+        import yaml
+        from pathlib import Path
+        init_path = Path("/problems") / f"oj-{problem.code}" / "init.yml"
+        if init_path.exists():
+            try:
+                with open(init_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                test_cases_cfg = cfg.get("test_cases", [])
+                
+                # Check if there is any batched structure
+                for item in test_cases_cfg:
+                    if isinstance(item, dict) and ("batched" in item or "cases" in item):
+                        is_batched = True
+                        break
+                
+                sorted_results = sorted(sub.judge_results, key=lambda r: r.id)
+                current_res_idx = 0
+                
+                # If submission is pending or running, show status as PENDING/RUNNING instead of SKIPPED
+                fallback_status = sub.status.value if sub.status.value in ("PENDING", "RUNNING") else "SKIPPED"
+                
+                if is_batched:
+                    for b_idx, item in enumerate(test_cases_cfg, start=1):
+                        if not isinstance(item, dict):
+                            continue
+                        sub_cases = item.get("batched") or item.get("cases") or []
+                        if not isinstance(sub_cases, list):
+                            continue
+                        
+                        batch_points = item.get("points", 0)
+                        cases_list = []
+                        batch_status = "AC"
+                        batch_earned_points = batch_points
+                        
+                        for tc_cfg in sub_cases:
+                            if not isinstance(tc_cfg, dict):
+                                continue
+                            
+                            if current_res_idx < len(sorted_results):
+                                jr = sorted_results[current_res_idx]
+                                current_res_idx += 1
+                                status = jr.status.value
+                                if status != "AC":
+                                    batch_status = status
+                                    batch_earned_points = 0
+                                    
+                                cases_list.append({
+                                    "id": jr.id,
+                                    "testcase_id": jr.testcase_id,
+                                    "status": status,
+                                    "time_ms": jr.time_ms,
+                                    "memory_kb": jr.memory_kb,
+                                    "output_log": jr.output_log,
+                                    "actual_output": jr.actual_output,
+                                    "points": tc_cfg.get("points", 0),
+                                    "in_file": tc_cfg.get("in"),
+                                    "out_file": tc_cfg.get("out"),
+                                    "sample": tc_cfg.get("sample", False)
+                                })
+                            else:
+                                batch_earned_points = 0
+                                if batch_status == "AC":
+                                    batch_status = fallback_status
+                                cases_list.append({
+                                    "id": None,
+                                    "testcase_id": None,
+                                    "status": fallback_status,
+                                    "time_ms": 0,
+                                    "memory_kb": 0,
+                                    "output_log": None,
+                                    "actual_output": None,
+                                    "points": tc_cfg.get("points", 0),
+                                    "in_file": tc_cfg.get("in"),
+                                    "out_file": tc_cfg.get("out"),
+                                    "sample": tc_cfg.get("sample", False)
+                                })
+                        
+                        if any(c["status"] != "AC" for c in cases_list):
+                            batch_earned_points = 0
+                            non_ac_statuses = [c["status"] for c in cases_list if c["status"] != "AC"]
+                            if non_ac_statuses:
+                                batch_status = non_ac_statuses[0]
+                        
+                        batches.append({
+                            "batch_index": b_idx,
+                            "points": batch_earned_points,
+                            "total_points": batch_points,
+                            "status": batch_status,
+                            "cases": cases_list
+                        })
+                else:
+                    # Flat problem
+                    for b_idx, tc_cfg in enumerate(test_cases_cfg, start=1):
+                        if not isinstance(tc_cfg, dict):
+                            continue
+                        
+                        batch_points = tc_cfg.get("points", 10)
+                        cases_list = []
+                        batch_status = "AC"
+                        batch_earned_points = batch_points
+                        
+                        if current_res_idx < len(sorted_results):
+                            jr = sorted_results[current_res_idx]
+                            current_res_idx += 1
+                            status = jr.status.value
+                            if status != "AC":
+                                batch_status = status
+                                batch_earned_points = 0
+                                
+                            cases_list.append({
+                                "id": jr.id,
+                                "testcase_id": jr.testcase_id,
+                                "status": status,
+                                "time_ms": jr.time_ms,
+                                "memory_kb": jr.memory_kb,
+                                "output_log": jr.output_log,
+                                "actual_output": jr.actual_output,
+                                "points": batch_points,
+                                "in_file": tc_cfg.get("in"),
+                                "out_file": tc_cfg.get("out"),
+                                "sample": tc_cfg.get("sample", False)
+                            })
+                        else:
+                            batch_earned_points = 0
+                            batch_status = fallback_status
+                            cases_list.append({
+                                "id": None,
+                                "testcase_id": None,
+                                "status": fallback_status,
+                                "time_ms": 0,
+                                "memory_kb": 0,
+                                "output_log": None,
+                                "actual_output": None,
+                                "points": batch_points,
+                                "in_file": tc_cfg.get("in"),
+                                "out_file": tc_cfg.get("out"),
+                                "sample": tc_cfg.get("sample", False)
+                            })
+                            
+                        batches.append({
+                            "batch_index": b_idx,
+                            "points": batch_earned_points,
+                            "total_points": batch_points,
+                            "status": batch_status,
+                            "cases": cases_list
+                        })
+            except Exception as e:
+                import logging
+                logging.getLogger("oj.api").error(f"Failed to build batches from init.yml: {e}")
+
     return {
         "id":           sub.id,
         "problem_code": problem.code if problem else "?",
@@ -190,8 +609,11 @@ async def get_submission(
         "time_ms":      sub.time_ms,
         "memory_kb":    sub.memory_kb,
         "error_log":    sub.error_log,
+        "source_code":  sub.source_code,
         "submitted_at": sub.submitted_at.isoformat(),
         "is_pending":   sub.status in (SubmissionStatus.PENDING, SubmissionStatus.RUNNING),
+        "is_batched":   is_batched,
+        "batches":      batches,
         "judge_results": [
             {
                 "id":          jr.id,
@@ -200,6 +622,7 @@ async def get_submission(
                 "time_ms":     jr.time_ms,
                 "memory_kb":   jr.memory_kb,
                 "output_log":  jr.output_log,
+                "actual_output": jr.actual_output,
             }
             for jr in sorted(sub.judge_results, key=lambda r: r.id)
         ],

@@ -67,6 +67,33 @@ async def get_current_user(
     return user
 
 
+async def get_current_user_optional(
+    request: Request,
+    token: str | None = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User | None:
+    """
+    Token байвал хэрэглэгчийг буцаана, байхгүй эсвэл хүчингүй бол None буцаана.
+    """
+    token = token or request.cookies.get("oj_access")
+    if not token:
+        return None
+    try:
+        payload = decode_token(token)
+        user_id: str = payload.get("sub")
+        token_type: str = payload.get("type", "access")
+        if user_id is None or token_type != "access":
+            return None
+    except Exception:
+        return None
+
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if user and user.is_active:
+        return user
+    return None
+
+
 def require_role(*allowed_roles: str):
     """
     Тодорхой эрхийн хязгаарлалт хийх dependency factory.

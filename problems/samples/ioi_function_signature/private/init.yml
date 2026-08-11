@@ -1,0 +1,6 @@
+archive: cases.zip
+time_limit: 1.0
+memory_limit: 64
+grader: grader.cpp
+test_cases:
+  - {in: case1.in, out: case1.out, points: 100, sample: true}

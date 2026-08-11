@@ -91,3 +91,40 @@ async def update_email_settings(
 
     await db.commit()
     return {"message": "И-мэйл SMTP тохиргоо амжилттай хадгалагдлаа."}
+
+
+@router.get(
+    "/judges/health",
+    summary="Шүүгч серверүүдийн (DMOJ Bridge) холболтыг шалгах",
+)
+async def check_judges_health(
+    current_user = Depends(require_role("admin", "teacher")),
+):
+    import socket
+    from app.core.config import settings
+
+    hosts = settings.DMOJ_BRIDGE_HOSTS.split(",")
+    results = []
+    
+    for host in hosts:
+        host = host.strip()
+        if not host:
+            continue
+        healthy = False
+        error_msg = None
+        try:
+            # Quick TCP connection check
+            s = socket.create_connection((host, settings.DMOJ_BRIDGE_PORT), timeout=1.0)
+            s.close()
+            healthy = True
+        except Exception as e:
+            error_msg = str(e)
+            
+        results.append({
+            "host": host,
+            "port": settings.DMOJ_BRIDGE_PORT,
+            "status": "online" if healthy else "offline",
+            "error": error_msg
+        })
+        
+    return results

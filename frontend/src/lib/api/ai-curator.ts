@@ -30,6 +30,9 @@ export const aiCuratorApi = {
   reject: (id: number) =>
     api.put<TopicData>(`/ai-tutor/curator/reject/${id}`).then((r) => r.data),
 
+  delete: (id: number) =>
+    api.delete(`/ai-tutor/curator/delete/${id}`).then((r) => r.data),
+
   getExportUrl: () => {
     const apiOrigin = process.env.NEXT_PUBLIC_API_ORIGIN?.replace(/\/$/, "") ?? "";
     return `${apiOrigin}/api/v1/ai-tutor/curator/export`;

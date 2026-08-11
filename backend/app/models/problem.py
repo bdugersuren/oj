@@ -48,6 +48,7 @@ class Problem(Base):
     division = Column(Enum(DivisionCategory), default=DivisionCategory.SENIOR, nullable=False)
     olympiad_year = Column(Integer, default=2024, nullable=True)
     source_citation = Column(String(255), nullable=True) # e.g. "2023 Нийслэлийн Олимпиад 2-р Даваа, 3-р Бодлого"
+    testcases_zip_key = Column(String(500), nullable=True) # S3/MinIO key for private.zip
 
     is_visible = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -77,8 +78,8 @@ class TestCase(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     problem_id = Column(Integer, ForeignKey("problems.id", ondelete="CASCADE"), nullable=False)
-    input_data = Column(Text, nullable=False)
-    output_data = Column(Text, nullable=False)
+    input_data = Column(Text, nullable=True)
+    output_data = Column(Text, nullable=True)
     points = Column(Integer, default=10, nullable=False)
     order = Column(Integer, default=1, nullable=False)
     is_sample = Column(Boolean, default=False, nullable=False)

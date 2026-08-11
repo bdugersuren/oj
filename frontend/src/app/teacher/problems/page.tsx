@@ -5,7 +5,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { problemApi, ProblemDifficulty } from "@/lib/api/problems";
 import { 
   Plus, Edit2, Trash2, Eye, EyeOff, Search, Compass, 
-  ChevronRight, RefreshCw, AlertCircle 
+  ChevronRight, RefreshCw, AlertCircle, Sparkles 
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -170,6 +170,10 @@ export default function TeacherProblemsList() {
 
                     <Link href={`/teacher/problems/${problem.code}`} className={buttonVariants({ variant: "ghost", size: "icon", className: "rounded-xl h-9 w-9 text-brand-cyan hover:text-brand-cyan/85" })}>
                       <Edit2 className="w-4 h-4" />
+                    </Link>
+
+                    <Link href={`/teacher/problems/${problem.code}/workspace`} className={buttonVariants({ variant: "ghost", size: "icon", className: "rounded-xl h-9 w-9 text-brand-cyan hover:text-brand-cyan/85" })} title="Workspace (Polygon)">
+                      <Sparkles className="w-4 h-4" />
                     </Link>
 
                     <Link href={`/teacher/problems/${problem.code}/testcases`} className={buttonVariants({ variant: "ghost", size: "icon", className: "rounded-xl h-9 w-9 text-brand-violet hover:text-brand-violet/85" })} title="Тест кэйс удирдах">

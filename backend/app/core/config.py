@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     
     # DMOJ
     DMOJ_BRIDGE_HOST: str = "bridge"
+    DMOJ_BRIDGE_HOSTS: str = "bridge1,bridge2"
     DMOJ_BRIDGE_PORT: int = 9999
     DMOJ_JUDGE_KEY: str = "dmoj_judge_auth_secret_key_2026"
 

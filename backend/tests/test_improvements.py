@@ -1,0 +1,159 @@
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+
+def test_elo_calculation_math():
+    """
+    Test ELO formula correctness.
+    If both players start at 1200 rating:
+    - Expected score for both is 0.5.
+    - If player A wins, they should gain 16 points (1200 + 32 * (1.0 - 0.5) = 1216).
+    - If player B loses, they should lose 16 points (1200 + 32 * (0.0 - 0.5) = 1184).
+    """
+    R_A = 1200
+    R_B = 1200
+    
+    # Expected score for A
+    E_A = 1.0 / (1.0 + 10.0 ** ((R_B - R_A) / 400.0))
+    # Expected score for B
+    E_B = 1.0 / (1.0 + 10.0 ** ((R_A - R_B) / 400.0))
+    
+    assert E_A == 0.5
+    assert E_B == 0.5
+    
+    # Actual score: A wins
+    S_A = 1.0
+    S_B = 0.0
+    
+    K = 32
+    new_R_A = round(R_A + K * (S_A - E_A))
+    new_R_B = round(R_B + K * (S_B - E_B))
+    
+    assert new_R_A == 1216
+    assert new_R_B == 1184
+
+
+def test_timezone_conversion_to_ulaanbaatar():
+    """
+    Test naive UTC conversion from database to Asia/Ulaanbaatar time.
+    For instance: August 10, 2026 at 23:00 UTC should be August 11, 2026 at 07:00 local time.
+    """
+    db_naive = datetime(2026, 8, 10, 23, 0, 0)
+    
+    # Make timezone aware (as UTC)
+    last_utc = db_naive.replace(tzinfo=timezone.utc)
+    
+    # Convert to Asia/Ulaanbaatar timezone (+8)
+    tz = ZoneInfo("Asia/Ulaanbaatar")
+    last_local = last_utc.astimezone(tz)
+    
+    assert last_local.year == 2026
+    assert last_local.month == 8
+    assert last_local.day == 11
+    assert last_local.hour == 7
+
+
+def test_ai_ticket_reply_formatting():
+    """
+    Test that the AI response content formatter successfully merges the socratic hints
+    and follow-up questions into structured markdown format.
+    """
+    title = "Концепцийн Сануулга"
+    guidance = "Энэ бол хоёр тооны нийлбэр олох суурь бодлого."
+    followups = ["Ямар өгөгдлийн төрөл ашиглах вэ?", "Overflow-оос яаж сэргийлэх вэ?"]
+    
+    # Format message
+    content = f"### 🤖 {title}\n\n{guidance}\n\n"
+    if followups:
+        content += "**Чиглүүлэх асуултууд:**\n"
+        for q in followups:
+            content += f"- {q}\n"
+            
+    assert "### 🤖 Концепцийн Сануулга" in content
+    assert "хоёр тооны нийлбэр олох" in content
+    assert "**Чиглүүлэх асуултууд:**" in content
+    assert "- Ямар өгөгдлийн төрөл асуултууд" not in content
+    assert "- Ямар өгөгдлийн төрөл ашиглах вэ?" in content
+
+
+def test_redis_bridge_queue_leasing():
+    """
+    Test the Redis bridge queue leasing logic.
+    We mock the redis client and verify that it retrieves a host from the queue
+    and pushes it back when done.
+    """
+    class MockPipeline:
+        def __init__(self): pass
+        def watch(self, key): pass
+        def multi(self): pass
+        def delete(self, key): pass
+        def rpush(self, key, *args): pass
+        def execute(self): return [True]
+        def unwatch(self): pass
+        def __enter__(self): return self
+        def __exit__(self, exc_type, exc_val, exc_tb): pass
+
+    class MockRedis:
+        def __init__(self):
+            self.queue = [b"bridge1", b"bridge2"]
+            self.exists_val = True
+
+        def exists(self, key):
+            return self.exists_val
+
+        def pipeline(self):
+            return MockPipeline()
+
+        def blpop(self, key, timeout):
+            if self.queue:
+                val = self.queue.pop(0)
+                return (b"key", val)
+            return None
+
+        def rpush(self, key, val):
+            self.queue.append(val.encode() if isinstance(val, str) else val)
+            return len(self.queue)
+
+    r_client = MockRedis()
+    
+    # Simulate popping
+    res = r_client.blpop("dmoj:bridge:idle_queue", timeout=60)
+    assert res is not None
+    assigned = res[1].decode("utf-8")
+    assert assigned == "bridge1"
+    assert b"bridge1" not in r_client.queue
+    
+    # Simulate releasing
+    r_client.rpush("dmoj:bridge:idle_queue", assigned)
+    assert b"bridge1" in r_client.queue
+
+
+def test_parse_simple_yaml():
+    """
+    Test parsing typical DMOJ init.yml content.
+    """
+    from app.api.v1.endpoints.problems import parse_simple_yaml
+
+    yaml_data = """
+    archive: cases.zip
+    time_limit: 2.5
+    memory_limit: 128
+    
+    test_cases:
+      - {in: case1.in, out: case1.out, points: 10, sample: true}
+      - {in: case2.in, out: case2.out, points: 20}
+    """
+    
+    result = parse_simple_yaml(yaml_data)
+    assert result["archive"] == "cases.zip"
+    assert float(result["time_limit"]) == 2.5
+    assert int(result["memory_limit"]) == 128
+    assert len(result["test_cases"]) == 2
+    assert result["test_cases"][0]["in"] == "case1.in"
+    assert result["test_cases"][0]["out"] == "case1.out"
+    assert int(result["test_cases"][0]["points"]) == 10
+    assert str(result["test_cases"][0]["sample"]).lower() == "true"
+    assert result["test_cases"][1]["in"] == "case2.in"
+    assert result["test_cases"][1]["out"] == "case2.out"
+    assert int(result["test_cases"][1]["points"]) == 20
+

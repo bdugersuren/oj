@@ -9,4 +9,6 @@ export const progressApi = {
   me: () => api.get<UserProgress>("/progress/me").then((r) => r.data),
   byUsername: (username: string) => api.get<UserProgress>(`/progress/${username}`).then((r) => r.data),
   achievements: () => api.get("/progress/achievements").then((r) => r.data),
+  resolveDuel: (opponentUsername: string, result: "win" | "loss" | "draw") =>
+    api.post("/progress/duel/resolve", { opponent_username: opponentUsername, result }).then((r) => r.data),
 };
