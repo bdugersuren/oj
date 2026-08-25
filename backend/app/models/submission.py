@@ -12,8 +12,10 @@ class SubmissionStatus(str, enum.Enum):
     WRONG_ANSWER = "WA"
     TIME_LIMIT = "TLE"
     MEMORY_LIMIT = "MLE"
+    OUTPUT_LIMIT = "OLE"
     RUNTIME_ERROR = "RTE"
     COMPILATION_ERROR = "CE"
+    SYSTEM_ERROR = "SYSTEM_ERROR"
 
 class Submission(Base):
     __tablename__ = "submissions"
@@ -31,6 +33,11 @@ class Submission(Base):
     error_log = Column(Text, nullable=True)
     submitted_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     is_sample_test = Column(Boolean, default=False, nullable=False)
+    judge_attempt = Column(Integer, default=0, nullable=False)
+    judge_lease_expires_at = Column(DateTime, nullable=True)
+    judge_started_at = Column(DateTime, nullable=True)
+    judge_finished_at = Column(DateTime, nullable=True)
+    rewards_applied_at = Column(DateTime, nullable=True)
 
     # Relationships
     user = relationship("User", back_populates="submissions")

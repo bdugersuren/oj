@@ -1,11 +1,12 @@
 # Build a local DMOJ tier-3 judge image as documented by DMOJ. The public
 # runtimes image only supplies language runtimes; it does not contain `dmoj`.
-FROM dmoj/runtimes-tier3:latest
+FROM dmoj/runtimes-tier3@sha256:1bed38136cd7dacc2a60cbc2a380d057ed9c5aea46bd866c6e6ab2bfb3a35838
 
-# Install testlib.h globally for custom checkers
-RUN curl -fsSL "https://raw.githubusercontent.com/MikeMirzayanov/testlib/master/testlib.h" -o /usr/include/testlib.h
+# Install a reviewed testlib release globally for custom checkers.
+ARG TESTLIB_REF=0.9.41
+RUN curl -fsSL "https://raw.githubusercontent.com/MikeMirzayanov/testlib/${TESTLIB_REF}/testlib.h" -o /usr/include/testlib.h
 
-ARG DMOJ_REF=master
+ARG DMOJ_REF=v5.0.0
 
 RUN mkdir /judge /problems /app && \
     chmod 1777 /problems && \

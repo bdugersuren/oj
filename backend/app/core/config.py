@@ -1,3 +1,4 @@
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
@@ -39,6 +40,47 @@ class Settings(BaseSettings):
     DMOJ_BRIDGE_HOSTS: str = "bridge1,bridge2"
     DMOJ_BRIDGE_PORT: int = 9999
     DMOJ_JUDGE_KEY: str = "dmoj_judge_auth_secret_key_2026"
+    JUDGE_LEASE_SECONDS: int = 300
+
+    @model_validator(mode="after")
+    def reject_insecure_production_defaults(self):
+        if self.ENVIRONMENT.lower() != "production":
+            return self
+
+        insecure_values = {
+            "supersecretkey-generate-a-strong-one-for-production-12345",
+            "oj_secure_password_2026",
+            "minioadmin_secure_2026",
+            "dmoj_judge_auth_secret_key_2026",
+        }
+        secret_values = {
+            "SECRET_KEY": self.SECRET_KEY,
+            "DATABASE_URL": self.DATABASE_URL,
+            "MINIO_ROOT_PASSWORD": self.MINIO_ROOT_PASSWORD,
+            "DMOJ_JUDGE_KEY": self.DMOJ_JUDGE_KEY,
+        }
+        invalid = [
+            name
+            for name, value in secret_values.items()
+            if not value
+            or any(default in value for default in insecure_values)
+            or "change-me" in value.lower()
+        ]
+        if invalid:
+            raise ValueError(
+                "Production secrets must be explicitly replaced: " + ", ".join(invalid)
+            )
+        if not self.COOKIE_SECURE:
+            raise ValueError("COOKIE_SECURE must be true in production.")
+        if self.JUDGE_LEASE_SECONDS < 60:
+            raise ValueError("JUDGE_LEASE_SECONDS must be at least 60 in production.")
+        origins = {item.strip() for item in self.CORS_ORIGINS.split(",") if item.strip()}
+        if not origins or any(
+            not item.startswith("https://") or "localhost" in item or "127.0.0.1" in item
+            for item in origins
+        ):
+            raise ValueError("Production CORS_ORIGINS must contain only explicit HTTPS origins.")
+        return self
 
     model_config = SettingsConfigDict(
         env_file=".env",

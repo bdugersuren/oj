@@ -25,7 +25,9 @@ async def seed_sample_problems():
             with open(zip_path, "rb") as f:
                 contents = f.read()
                 
-            with zipfile.ZipFile(io.BytesIO(contents)) as z:
+            from app.services.safe_archive import open_validated_zip
+
+            with open_validated_zip(contents) as z:
                 namelist = z.namelist()
                 
                 public_statement_path = next((f for f in namelist if f.endswith("public/statement.md")), None)

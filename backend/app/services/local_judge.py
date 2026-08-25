@@ -90,8 +90,9 @@ class LocalSubprocessJudge:
                 shutil.rmtree(local_dir, ignore_errors=True)
                 local_dir.mkdir(parents=True, exist_ok=True)
                 
-                with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-                    z.extractall(local_dir)
+                from app.services.safe_archive import safe_extract_zip
+
+                safe_extract_zip(zip_bytes, local_dir)
                     
                 # DMOJ-ийн "archive: cases.zip" тохиргоонд зориулж хадгална
                 with open(local_dir / "cases.zip", "wb") as f:

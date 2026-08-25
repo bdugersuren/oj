@@ -4,6 +4,7 @@ import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from jose import JWTError
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 import redis.asyncio as aioredis
 
 from app.core.config import settings
@@ -15,6 +16,27 @@ from app.models.contest import Contest, ContestParticipant
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _submission_event_payload(submission: Submission) -> dict:
+    return {
+        "submission_id": submission.id,
+        "status": submission.status.value,
+        "score": submission.score,
+        "time_ms": submission.time_ms,
+        "memory_kb": submission.memory_kb,
+        "judge_results": [
+            {
+                "id": result.id,
+                "testcase_id": result.testcase_id,
+                "status": result.status.value,
+                "time_ms": result.time_ms,
+                "memory_kb": result.memory_kb,
+                "output_log": result.output_log,
+            }
+            for result in sorted(submission.judge_results, key=lambda item: item.id)
+        ],
+    }
 
 
 async def _websocket_user(websocket: WebSocket) -> User | None:
@@ -65,6 +87,22 @@ async def submission_status_ws(websocket: WebSocket, submission_id: int):
             "status": "CONNECTED",
             "message": "Waiting for judge results..."
         })
+
+        # Pub/Sub is intentionally subscribed before this snapshot query. If
+        # grading finished before the subscription, the DB snapshot delivers
+        # the final state; if it finishes afterwards, the event is queued.
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Submission)
+                .options(selectinload(Submission.judge_results))
+                .where(Submission.id == submission_id)
+            )
+            current = result.scalar_one_or_none()
+        if current:
+            snapshot = _submission_event_payload(current)
+            await websocket.send_json(snapshot)
+            if snapshot["status"] not in ("PENDING", "RUNNING"):
+                return
 
         # Redis-ээс ирэх мессежүүдийг сонсох гол давталт
         while True:

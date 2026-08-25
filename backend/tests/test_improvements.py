@@ -76,56 +76,38 @@ def test_ai_ticket_reply_formatting():
     assert "- Ямар өгөгдлийн төрөл ашиглах вэ?" in content
 
 
-def test_redis_bridge_queue_leasing():
-    """
-    Test the Redis bridge queue leasing logic.
-    We mock the redis client and verify that it retrieves a host from the queue
-    and pushes it back when done.
-    """
-    class MockPipeline:
-        def __init__(self): pass
-        def watch(self, key): pass
-        def multi(self): pass
-        def delete(self, key): pass
-        def rpush(self, key, *args): pass
-        def execute(self): return [True]
-        def unwatch(self): pass
-        def __enter__(self): return self
-        def __exit__(self, exc_type, exc_val, exc_tb): pass
+def test_redis_bridge_lease_skips_busy_host():
+    from app.workers.judge_worker import _acquire_bridge_lease
+
+    class MockLock:
+        def __init__(self, acquired):
+            self.acquired = acquired
+
+        def acquire(self, blocking=False):
+            assert blocking is False
+            return self.acquired
 
     class MockRedis:
-        def __init__(self):
-            self.queue = [b"bridge1", b"bridge2"]
-            self.exists_val = True
+        def incr(self, _key):
+            return 2  # start at bridge1 for a two-host list
 
-        def exists(self, key):
-            return self.exists_val
+        def lock(self, key, **kwargs):
+            assert kwargs == {
+                "timeout": 120,
+                "blocking": False,
+                "thread_local": False,
+            }
+            return MockLock(acquired=key.endswith("bridge2"))
 
-        def pipeline(self):
-            return MockPipeline()
+    assigned, lease = _acquire_bridge_lease(
+        MockRedis(),
+        ["bridge1", "bridge2"],
+        wait_seconds=0,
+        lease_seconds=120,
+    )
 
-        def blpop(self, key, timeout):
-            if self.queue:
-                val = self.queue.pop(0)
-                return (b"key", val)
-            return None
-
-        def rpush(self, key, val):
-            self.queue.append(val.encode() if isinstance(val, str) else val)
-            return len(self.queue)
-
-    r_client = MockRedis()
-    
-    # Simulate popping
-    res = r_client.blpop("dmoj:bridge:idle_queue", timeout=60)
-    assert res is not None
-    assigned = res[1].decode("utf-8")
-    assert assigned == "bridge1"
-    assert b"bridge1" not in r_client.queue
-    
-    # Simulate releasing
-    r_client.rpush("dmoj:bridge:idle_queue", assigned)
-    assert b"bridge1" in r_client.queue
+    assert assigned == "bridge2"
+    assert lease.acquired is True
 
 
 def test_parse_simple_yaml():
@@ -156,4 +138,3 @@ def test_parse_simple_yaml():
     assert result["test_cases"][1]["in"] == "case2.in"
     assert result["test_cases"][1]["out"] == "case2.out"
     assert int(result["test_cases"][1]["points"]) == 20
-

@@ -7,10 +7,18 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.services.achievement_engine import initialize_achievements
 from app.services.worlds_seed import initialize_worlds_and_stages
+from app.services.storage import storage_client
 from app.core.session import CSRF_COOKIE
+import anyio
+from sqlalchemy import text
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # External I/O belongs to application startup, not module import. This keeps
+    # CLI tools and unit-test collection deterministic while still failing
+    # startup if required object storage is unavailable.
+    await anyio.to_thread.run_sync(storage_client.initialize_buckets)
+
     # Startup: seed achievements and worlds data
     async with AsyncSessionLocal() as db:
         await initialize_achievements(db)
@@ -53,6 +61,7 @@ async def csrf_protection(request: Request, call_next):
 
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
+@app.get("/health/live")
 @app.get("/api/health")
 async def health_check():
     return {
@@ -61,6 +70,40 @@ async def health_check():
         "phase": 1,
         "ai_enabled": False,
     }
+
+
+@app.get("/health/ready")
+async def readiness_check():
+    """Verify required dependencies without exposing credentials or topology."""
+    checks = {"postgres": False, "redis": False, "minio": False}
+    try:
+        async with AsyncSessionLocal() as db:
+            await db.execute(text("SELECT 1"))
+        checks["postgres"] = True
+    except Exception:
+        pass
+    try:
+        from redis.asyncio import Redis
+
+        redis_client = Redis.from_url(settings.REDIS_URL)
+        try:
+            checks["redis"] = bool(await redis_client.ping())
+        finally:
+            await redis_client.aclose()
+    except Exception:
+        pass
+    try:
+        checks["minio"] = await anyio.to_thread.run_sync(
+            storage_client.client.bucket_exists,
+            settings.MINIO_BUCKET_PROBLEMS,
+        )
+    except Exception:
+        pass
+    ready = all(checks.values())
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"status": "ready" if ready else "not_ready", "checks": checks},
+    )
 
 @app.get("/api/v1")
 async def root_v1():

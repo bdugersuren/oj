@@ -1,7 +1,7 @@
 import { api } from "./client";
 
 export type ProblemDifficulty = "Bronze" | "Silver" | "Gold" | "Platinum" | "Diamond";
-export type SubmissionStatus = "PENDING" | "RUNNING" | "AC" | "WA" | "TLE" | "MLE" | "RE" | "CE" | "SYSTEM_ERROR";
+export type SubmissionStatus = "PENDING" | "RUNNING" | "AC" | "WA" | "TLE" | "MLE" | "OLE" | "RTE" | "CE" | "SYSTEM_ERROR";
 
 export interface TestCase { 
   id: number; 
@@ -169,21 +169,6 @@ export const problemApi = {
   },
   getStatementPdf: (code: string) =>
     api.get<{ url: string }>(`/problems/${code}/statement-pdf`).then((r) => r.data),
-
-  runSamples: (code: string, language: string, source_code: string) =>
-    api.post<{
-      status: string;
-      time_ms: number;
-      memory_kb: number;
-      testcases: Array<{
-        testcase_id: number;
-        status: string;
-        time_ms: number;
-        memory_kb: number;
-        actual_output?: string | null;
-        checker_output?: string | null;
-      }>;
-    }>(`/problems/${code}/run-samples`, { language, source_code }).then((r) => r.data),
 
   leaderboard: (code: string) =>
     api.get<Array<{

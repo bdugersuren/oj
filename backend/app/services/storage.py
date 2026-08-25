@@ -21,9 +21,8 @@ class MinioStorage:
             secret_key=settings.MINIO_ROOT_PASSWORD,
             secure=False
         )
-        self._initialize_buckets()
 
-    def _initialize_buckets(self):
+    def initialize_buckets(self):
         """Платформд шаардлагатай бүх bucket-уудыг үүсгэж эхлүүлнэ."""
         import json
         buckets = [

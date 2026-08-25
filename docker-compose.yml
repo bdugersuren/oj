@@ -6,6 +6,12 @@ services:
       dockerfile: Dockerfile
     container_name: oj-nextjs
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 1g
 
     environment:
       - NODE_ENV=production
@@ -21,18 +27,50 @@ services:
       dockerfile: Dockerfile
     container_name: oj-fastapi
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 1g
     env_file:
       - .env
-    volumes:
-      - problems_data:/problems
-      - ./backend:/app
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
       minio:
-        condition: service_started
+        condition: service_healthy
+    networks:
+      - oj-network
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: oj-migrate
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 512m
+    command: python scripts/bootstrap_database.py
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
     networks:
       - oj-network
 
@@ -43,12 +81,12 @@ services:
       dockerfile: Dockerfile
     container_name: oj-postgres
     restart: unless-stopped
+    pids_limit: 256
+    mem_limit: 2g
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-oj_db}
       POSTGRES_USER: ${POSTGRES_USER:-oj_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oj_secure_password_2026}
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -67,6 +105,8 @@ services:
       dockerfile: Dockerfile
     container_name: oj-redis
     restart: unless-stopped
+    pids_limit: 128
+    mem_limit: 512m
     volumes:
       - redisdata:/data
     healthcheck:
@@ -76,6 +116,7 @@ services:
       retries: 5
     networks:
       - oj-network
+      - judge-network
 
   # 5. MinIO Object Storage (Problem Statements, PDFs, Testcases, Assets)
   minio:
@@ -84,13 +125,17 @@ services:
       dockerfile: Dockerfile
     container_name: oj-minio
     restart: unless-stopped
+    pids_limit: 256
+    mem_limit: 2g
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin_secure_2026}
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     volumes:
       - miniodata:/data
     networks:
@@ -98,11 +143,18 @@ services:
 
   # 6. Celery Async Task Worker (Grading Dispatcher & PDF Reporting)
   celery:
+    profiles: ["judge"]
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: oj-celery
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: 2g
     command: celery -A app.core.celery_app worker --loglevel=info -Q judge_queue,celery --concurrency=4
     env_file:
       - .env
@@ -111,41 +163,72 @@ services:
     volumes:
       - problems_data:/problems
     depends_on:
-      - api
-      - redis
-      - bridge1
-      - bridge2
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      bridge1:
+        condition: service_healthy
+      bridge2:
+        condition: service_healthy
     networks:
       - oj-network
+      - judge-network
 
   # 7. DMOJ tier-3 Judge Bridge Replicas (Isolated via cpuset)
   bridge1:
+    profiles: ["judge"]
     build:
       context: ./judge/bridge
       dockerfile: Dockerfile
     image: oj-dmoj-tier3
     container_name: oj-dmoj-bridge-1
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_add:
+      - SYS_PTRACE
+    pids_limit: 512
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "/env/bin/python3", "-c", "import socket,struct; s=socket.create_connection(('127.0.0.1',9999),2); p=b'{\"health\":true}'; s.sendall(struct.pack('!I',len(p))+p); assert len(s.recv(4))==4"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     cpuset: "0"  # Pinned to CPU Core 0
     volumes:
       - ./judge/judge-tier3/judge.yml:/judge/judge.yml:ro
       - problems_data:/problems
     networks:
-      - oj-network
+      - judge-network
 
   bridge2:
+    profiles: ["judge"]
     build:
       context: ./judge/bridge
       dockerfile: Dockerfile
     image: oj-dmoj-tier3
     container_name: oj-dmoj-bridge-2
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_add:
+      - SYS_PTRACE
+    pids_limit: 512
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "/env/bin/python3", "-c", "import socket,struct; s=socket.create_connection(('127.0.0.1',9999),2); p=b'{\"health\":true}'; s.sendall(struct.pack('!I',len(p))+p); assert len(s.recv(4))==4"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     cpuset: "1"  # Pinned to CPU Core 1
     volumes:
       - ./judge/judge-tier3/judge.yml:/judge/judge.yml:ro
       - problems_data:/problems
     networks:
-      - oj-network
+      - judge-network
 
   # Nginx Proxy Manager (NPM)
   npm:
@@ -156,7 +239,7 @@ services:
     restart: unless-stopped
     ports:
       - '80:80'
-      - '81:81'
+      - '127.0.0.1:81:81'
       - '443:443'
     volumes:
       - ./config/npm/data:/data
@@ -170,13 +253,12 @@ services:
 
   # 8. Ollama Local LLM Service
   ollama:
+    profiles: ["ai", "admin-tools"]
     build:
       context: ./config/ollama
       dockerfile: Dockerfile
     container_name: oj-ollama
     restart: unless-stopped
-    ports:
-      - "11434:11434"
     volumes:
       - ollamadata:/root/.ollama
     deploy:
@@ -191,16 +273,15 @@ services:
 
   # 9. Open WebUI (AI testing & prompt management)
   open-webui:
+    profiles: ["admin-tools"]
     build:
       context: ./config/open-webui
       dockerfile: Dockerfile
     container_name: oj-open-webui
     restart: unless-stopped
-    ports:
-      - "3080:8080"
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
-      - WEBUI_SECRET_KEY=supersecretkey-openwebui-2026
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-}
     volumes:
       - openwebuidata:/app/backend/data
     depends_on:
@@ -210,14 +291,12 @@ services:
 
   # 10. Qdrant Vector Database
   qdrant:
+    profiles: ["ai"]
     build:
       context: ./config/qdrant
       dockerfile: Dockerfile
     container_name: oj-qdrant
     restart: unless-stopped
-    ports:
-      - "6333:6333"
-      - "6334:6334"
     volumes:
       - qdrantdata:/qdrant/storage
     networks:
@@ -225,6 +304,7 @@ services:
 
   # 11. pgAdmin (PostgreSQL Database viewer tool)
   pgadmin:
+    profiles: ["admin-tools"]
     build:
       context: ./config/pgadmin
       dockerfile: Dockerfile
@@ -232,9 +312,9 @@ services:
     restart: unless-stopped
     environment:
       PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@know.mn}
-      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin_secure_pass_2026}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-}
     ports:
-      - "5050:80"
+      - "127.0.0.1:5050:80"
     depends_on:
       - db
     networks:
@@ -243,6 +323,9 @@ services:
 networks:
   oj-network:
     driver: bridge
+  judge-network:
+    driver: bridge
+    internal: true
 
 volumes:
   pgdata:

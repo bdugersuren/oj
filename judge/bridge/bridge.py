@@ -1,6 +1,7 @@
 """Length-prefixed JSON adapter from OJ FastAPI jobs to DMOJ's local Judge engine."""
 import json
 import logging
+import multiprocessing
 import os
 import shutil
 import socketserver
@@ -52,7 +53,16 @@ LANGUAGES = {
     # C#
     "mono-csc": "MONOCS",
 }
-STATUS_PRIORITY = ((Result.TLE, "TLE"), (Result.MLE, "MLE"), (Result.RTE, "RTE"), (Result.WA, "WA"))
+STATUS_PRIORITY = (
+    (Result.TLE, "TLE"),
+    (Result.MLE, "MLE"),
+    (getattr(Result, "OLE", 0), "OLE"),
+    (Result.RTE, "RTE"),
+    # DMOJ uses IR for a non-zero process exit code. The platform's public
+    # verdict model represents both signal crashes and non-zero exits as RTE.
+    (Result.IR, "RTE"),
+    (Result.WA, "WA"),
+)
 
 
 class CapturePackets:
@@ -96,6 +106,9 @@ class CapturePackets:
             "time_ms": round(result.execution_time * 1000, 3),
             "memory_kb": result.max_memory,
             "checker_output": result.extended_feedback or result.feedback or result.output,
+            # Kept private unless the caller explicitly requests capture mode.
+            # DMOJ has already applied its per-case output limit at this point.
+            "_program_output": result.output,
         })
 
 
@@ -183,10 +196,20 @@ class DMOJAdapter:
                 if self.packets.compile_error:
                     return {"status": "CE", "score": 0, "time_ms": 0, "memory_kb": 0, "error_log": self.packets.compile_error, "test_results": []}
                 if self.packets.internal_error:
-                    return {"status": "RTE", "score": 0, "time_ms": 0, "memory_kb": 0, "error_log": self.packets.internal_error, "test_results": []}
+                    return {"status": "SYSTEM_ERROR", "score": 0, "time_ms": 0, "memory_kb": 0, "error_log": self.packets.internal_error, "test_results": []}
                 test_results = []
+                capture_output = payload.get("capture_output") is True
                 for item in self.packets.results:
                     position = item.pop("position")
+                    program_output = item.pop("_program_output", "")
+                    if capture_output:
+                        item["program_output"] = program_output
+                        # Capture jobs intentionally compare against an empty
+                        # expected output. WA therefore only means the program
+                        # produced the requested artifact; execution failures
+                        # retain their higher-priority verdict above.
+                        if item["status"] == "WA":
+                            item["status"] = "AC"
                     item["testcase_id"] = testcase_ids[position - 1] if testcase_ids else position
                     test_results.append(item)
                 statuses = {item["status"] for item in test_results}
@@ -200,7 +223,7 @@ class DMOJAdapter:
                 }
             except Exception as exc:
                 LOG.exception("DMOJ grading failed")
-                return {"status": "RTE", "score": 0, "time_ms": 0, "memory_kb": 0, "error_log": str(exc), "test_results": []}
+                return {"status": "SYSTEM_ERROR", "score": 0, "time_ms": 0, "memory_kb": 0, "error_log": str(exc), "test_results": []}
             finally:
                 if directory:
                     shutil.rmtree(directory, ignore_errors=True)
@@ -211,16 +234,23 @@ class Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         try:
             payload = ADAPTER._recv(self.request)
-            ADAPTER._send(self.request, ADAPTER.grade(payload))
+            if payload.get("health") is True:
+                ADAPTER._send(self.request, {"status": "HEALTHY"})
+            else:
+                ADAPTER._send(self.request, ADAPTER.grade(payload))
         except Exception as exc:
             LOG.exception("Bridge request failed")
-            ADAPTER._send(self.request, {"status": "RTE", "score": 0, "time_ms": 0, "memory_kb": 0, "error_log": str(exc), "test_results": []})
+            ADAPTER._send(self.request, {"status": "SYSTEM_ERROR", "score": 0, "time_ms": 0, "memory_kb": 0, "error_log": str(exc), "test_results": []})
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    # Python 3.14 defaults to forkserver on POSIX. DMOJ's per-submission worker
+    # must inherit the freshly invalidated dynamic problem-root cache, so use
+    # fork from this single-threaded bridge process explicitly.
+    multiprocessing.set_start_method("fork", force=True)
     ADAPTER = DMOJAdapter()
-    with socketserver.ThreadingTCPServer(("0.0.0.0", 9999), Handler) as server:
+    with socketserver.TCPServer(("0.0.0.0", 9999), Handler) as server:
         server.allow_reuse_address = True
         LOG.info("DMOJ tier-3 adapter listening on port 9999")
         server.serve_forever()

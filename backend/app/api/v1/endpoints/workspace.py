@@ -2,10 +2,7 @@ import io
 import os
 import re
 import zipfile
-import shutil
-import tempfile
 import logging
-import subprocess
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
 from fastapi.responses import StreamingResponse, Response
@@ -20,6 +17,8 @@ from app.core.dependencies import require_role
 from app.services.storage import storage_client
 from app.models.user import User
 from app.models.problem import Problem, TestCase, DifficultyLevel, OlympiadScope, DivisionCategory
+from app.models.workspace_job import WorkspaceJudgeJob
+from app.core.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -128,7 +127,9 @@ def _import_published_to_drafts(user_id: str, problem: Problem, testcases: List[
             response.close()
             response.release_conn()
             
-            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+            from app.services.safe_archive import open_validated_zip
+
+            with open_validated_zip(zip_data) as zf:
                 for name in zf.namelist():
                     if not name.endswith("/"):
                         file_content = zf.read(name).decode("utf-8", errors="replace")
@@ -240,124 +241,47 @@ async def save_workspace_file_content(
     return {"status": "success", "message": f"File '{filename}' successfully saved."}
 
 
-@router.post("/{code}/generate-testcases", summary="Тест кэйсийг автоматаар үүсгэх (Generator & Model Solution)")
+@router.post(
+    "/{code}/generate-testcases",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Тест кэйсийг автоматаар үүсгэх (Generator & Model Solution)",
+)
 async def generate_workspace_testcases(
     code: str,
     payload: GeneratePayload,
-    current_user: User = Depends(require_role("teacher", "admin"))
+    current_user: User = Depends(require_role("teacher", "admin")),
+    db: AsyncSession = Depends(get_db),
 ):
-    code = code.upper()
-    user_id = str(current_user.id)
-    
-    # Файлуудыг татаж аваад локал түр хавтаст компиляци хийнэ
-    def _generate():
-        # 1. Шаардлагатай файлуудыг унших
-        try:
-            solution_code = _read_draft_file(user_id, code, "solution.cpp")
-            generator_code = _read_draft_file(user_id, code, "generator.cpp")
-        except Exception:
-            raise ValueError("Уг бодлогод 'solution.cpp' болон 'generator.cpp' бэлтгэгдээгүй байна.")
-            
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # 2. Compile solution.cpp
-            sol_src = os.path.join(temp_dir, "solution.cpp")
-            sol_bin = os.path.join(temp_dir, "solution.out")
-            with open(sol_src, "w", encoding="utf-8") as f:
-                f.write(solution_code)
-                
-            res = subprocess_run(["g++", "-O3", "-std=c++17", sol_src, "-o", sol_bin, "-lm"])
-            if res.returncode != 0:
-                raise ValueError(f"Model Solution (solution.cpp) компиляцийн алдаа:\n{res.stderr}")
-                
-            # 3. Copy testlib.h and Compile generator.cpp
-            # testlib.h файлыг олох
-            testlib_path = "/usr/include/testlib.h"
-            if not os.path.exists(testlib_path):
-                # Download testlib.h from GitHub if missing in development
-                import urllib.request
-                try:
-                    urllib.request.urlretrieve("https://raw.githubusercontent.com/MikeMirzayanov/testlib/master/testlib.h", os.path.join(temp_dir, "testlib.h"))
-                except Exception as e:
-                    logger.error(f"Failed to fetch testlib.h from github: {e}")
-            else:
-                shutil.copy(testlib_path, os.path.join(temp_dir, "testlib.h"))
-                
-            gen_src = os.path.join(temp_dir, "generator.cpp")
-            gen_bin = os.path.join(temp_dir, "generator.out")
-            with open(gen_src, "w", encoding="utf-8") as f:
-                f.write(generator_code)
-                
-            res = subprocess_run(["g++", "-O3", "-std=c++17", gen_src, "-o", gen_bin])
-            if res.returncode != 0:
-                raise ValueError(f"Generator (generator.cpp) компиляцийн алдаа:\n{res.stderr}")
-                
-            # 4. Generate inputs and outputs
-            generated_cases = []
-            tc_configs = []
-            
-            # Start order from existing count or 1
-            order_idx = 1
-            
-            for p_idx, gen_args in enumerate(payload.params, start=1):
-                input_file = os.path.join(temp_dir, f"case_{p_idx}.in")
-                output_file = os.path.join(temp_dir, f"case_{p_idx}.out")
-                
-                # Run generator: gen.out [args] > input.in
-                args_list = [gen_bin] + gen_args.split()
-                with open(input_file, "w", encoding="utf-8") as inf:
-                    res = subprocess_run(args_list, stdout=inf)
-                    if res.returncode != 0:
-                        raise ValueError(f"Generator ажиллуулахад алдаа гарлаа (Аргумент: '{gen_args}'):\n{res.stderr}")
-                        
-                # Run model solution: solution.out < input.in > output.out
-                with open(input_file, "r") as inf, open(output_file, "w") as outf:
-                    res = subprocess_run([sol_bin], stdin=inf, stdout=outf)
-                    if res.returncode != 0:
-                        raise ValueError(f"Model Solution ажиллуулахад алдаа гарлаа:\n{res.stderr}")
-                        
-                # Read content to write to drafts
-                in_content = ""
-                out_content = ""
-                with open(input_file, "r", encoding="utf-8", errors="replace") as f:
-                    in_content = f.read()
-                with open(output_file, "r", encoding="utf-8", errors="replace") as f:
-                    out_content = f.read()
-                    
-                in_key = f"cases/{order_idx}.in"
-                out_key = f"cases/{order_idx}.out"
-                
-                _write_draft_file(user_id, code, in_key, in_content)
-                _write_draft_file(user_id, code, out_key, out_content)
-                sample_str = ", sample: true" if order_idx == 1 else ""
-                tc_configs.append(f"  - {{in: {in_key}, out: {out_key}, points: {payload.points_per_case}{sample_str}}}")
-                generated_cases.append({"idx": order_idx, "args": gen_args})
-                order_idx += 1
-                
-            # 5. init.yml шинэчлэх
-            init_content = (
-                f"archive: cases.zip\n"
-                f"time_limit: 1.0\n"
-                f"memory_limit: 64\n"
-                f"test_cases:\n" + "\n".join(tc_configs) + "\n"
-            )
-            _write_draft_file(user_id, code, "init.yml", init_content)
-            
-            # Save generator parameters and points for UI persistence
-            params_str = "\n".join(payload.params)
-            _write_draft_file(user_id, code, "generator.params", params_str)
-            _write_draft_file(user_id, code, "generator.points", str(payload.points_per_case))
-            
-            return generated_cases
+    params = [item.strip() for item in payload.params]
+    if not params or len(params) > 20:
+        raise HTTPException(status_code=422, detail="1-20 generator parameter мөр шаардлагатай.")
+    if payload.points_per_case < 1 or payload.points_per_case > 1000:
+        raise HTTPException(status_code=422, detail="Тестийн оноо 1-1000 хооронд байна.")
+    if any(not item or len(item.encode("utf-8")) > 256 for item in params):
+        raise HTTPException(status_code=422, detail="Parameter мөр бүр 1-256 byte байна.")
+    if sum(len(item.encode("utf-8")) for item in params) > 8192:
+        raise HTTPException(status_code=422, detail="Generator parameter-ийн нийт хэмжээ 8KB-ээс их байна.")
 
-    try:
-        results = await anyio.to_thread.run_sync(_generate)
-        return {"status": "success", "message": f"{len(results)} testcases generated successfully.", "cases": results}
-    except ValueError as val_err:
-        raise HTTPException(status_code=400, detail=str(val_err))
-    except Exception as e:
-        logger.exception("Failed to generate testcases")
-        raise HTTPException(status_code=500, detail=f"Алдаа гарлаа: {str(e)}")
-
+    job = WorkspaceJudgeJob(
+        user_id=current_user.id,
+        problem_code=code.upper(),
+        kind="generate_testcases",
+        status="QUEUED",
+        request_payload={"params": params, "points_per_case": payload.points_per_case},
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    celery_app.send_task(
+        "app.workers.judge_worker.execute_workspace_generator",
+        args=[job.id],
+        queue="judge_queue",
+    )
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "poll_url": f"/api/v1/workspace/judge-jobs/{job.id}",
+    }
 
 @router.post("/{code}/upload-testcases-zip", summary="Тест кэйсийг ZIP файлаар шууд оруулах (тайлбарлан задлах)")
 async def upload_workspace_testcases_zip(
@@ -377,6 +301,9 @@ async def upload_workspace_testcases_zip(
     def _process_zip():
         try:
             archive = zipfile.ZipFile(io.BytesIO(zip_bytes))
+            from app.services.safe_archive import validate_zip
+
+            validate_zip(archive)
         except Exception as e:
             raise ValueError(f"ZIP файлыг нээхэд алдаа гарлаа: {str(e)}")
 
@@ -709,34 +636,6 @@ async def publish_workspace(
     return {"status": "success", "message": f"Бодлого '{code}' амжилттай нийтлэгдэж баталгаажлаа."}
 
 
-# Subprocess run wrapper helper
-def subprocess_run(cmd, stdin=None, stdout=None) -> subprocess.CompletedProcess:
-    try:
-        res = subprocess.run(
-            cmd,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=10.0
-        )
-        return res
-    except subprocess.TimeoutExpired as te:
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=-9,
-            stdout="",
-            stderr="Хугацаа хэтэрлээ (10 сек)"
-        )
-    except Exception as e:
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=-1,
-            stdout="",
-            stderr=str(e)
-        )
-
-
 class CreateFilePayload(BaseModel):
     filename: str
     template_type: Optional[str] = None
@@ -907,192 +806,54 @@ async def serve_workspace_asset(
         raise HTTPException(status_code=404, detail="Asset олдсонгүй.")
 
 
-@router.post("/{code}/test-solution")
+@router.post("/{code}/test-solution", status_code=status.HTTP_202_ACCEPTED)
 async def verify_workspace_solution(
     code: str,
-    current_user: User = Depends(require_role("teacher", "admin"))
+    current_user: User = Depends(require_role("teacher", "admin")),
+    db: AsyncSession = Depends(get_db),
 ):
-    code = code.upper()
-    user_id = str(current_user.id)
-    
-    def _test():
-        # 1. Read solution.cpp
-        try:
-            solution_code = _read_draft_file(user_id, code, "solution.cpp")
-        except Exception:
-            raise HTTPException(status_code=400, detail="Model solution (solution.cpp) олдсонгүй.")
-            
-        # 2. Check if custom checker exists
-        checker_code = None
-        try:
-            checker_code = _read_draft_file(user_id, code, "checker.cpp")
-        except Exception:
-            pass
-            
-        # 3. Find all testcases in drafts
-        # We can read init.yml first
-        flat_cases = []
-        try:
-            init_content = _read_draft_file(user_id, code, "init.yml")
-            from app.api.v1.endpoints.problems import parse_simple_yaml
-            init_cfg = parse_simple_yaml(init_content)
-            testcases_cfg = init_cfg.get("test_cases", [])
-            
-            is_nested = len(testcases_cfg) > 0 and "cases" in testcases_cfg[0]
-            if is_nested:
-                for subtask in testcases_cfg:
-                    sub_cases_cfg = subtask.get("cases", [])
-                    if isinstance(sub_cases_cfg, list):
-                        for tc in sub_cases_cfg:
-                            flat_cases.append({
-                                "in": tc.get("in"),
-                                "out": tc.get("out"),
-                                "points": tc.get("points", 10),
-                                "sample": tc.get("sample", False)
-                            })
-            else:
-                for tc in testcases_cfg:
-                    flat_cases.append({
-                        "in": tc.get("in"),
-                        "out": tc.get("out"),
-                        "points": tc.get("points", 10),
-                        "sample": tc.get("sample", False)
-                    })
-        except Exception:
-            # If init.yml parsing fails, fall back to listing cases/ directory in drafts
-            pass
-            
-        # If no cases found via init.yml, let's scan all files in drafts
-        if not flat_cases:
-            all_files = _list_draft_files(user_id, code)
-            in_files = sorted([f for f in all_files if f.startswith("cases/") and f.endswith(".in")])
-            for inf in in_files:
-                outf = inf[:-3] + ".out"
-                if outf in all_files:
-                    flat_cases.append({
-                        "in": inf,
-                        "out": outf,
-                        "points": 10,
-                        "sample": False
-                    })
-                    
-        if not flat_cases:
-            raise HTTPException(status_code=400, detail="Тест кэйсүүд олдсонгүй. Эхлээд тест кэйсүүдийг zip файлаар оруулна уу.")
-            
-        # Time and memory limits
-        time_limit = 1.0
-        memory_limit = 64
-        try:
-            init_content = _read_draft_file(user_id, code, "init.yml")
-            from app.api.v1.endpoints.problems import parse_simple_yaml
-            init_cfg = parse_simple_yaml(init_content)
-            if "time_limit" in init_cfg:
-                time_limit = float(init_cfg["time_limit"])
-            if "memory_limit" in init_cfg:
-                memory_limit = int(init_cfg["memory_limit"])
-        except Exception:
-            pass
+    job = WorkspaceJudgeJob(
+        user_id=current_user.id,
+        problem_code=code.upper(),
+        kind="verify_solution",
+        status="QUEUED",
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    celery_app.send_task(
+        "app.workers.judge_worker.execute_workspace_solution",
+        args=[job.id],
+        queue="judge_queue",
+    )
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "poll_url": f"/api/v1/workspace/judge-jobs/{job.id}",
+    }
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Compile solution.cpp
-            sol_src = os.path.join(temp_dir, "solution.cpp")
-            sol_bin = os.path.join(temp_dir, "solution.out")
-            with open(sol_src, "w", encoding="utf-8") as f:
-                f.write(solution_code)
-                
-            res = subprocess_run(["g++", "-O3", "-std=c++20", sol_src, "-o", sol_bin, "-lm"])
-            if res.returncode != 0:
-                # Try c++17 if c++20 fails for some reason
-                res = subprocess_run(["g++", "-O3", "-std=c++17", sol_src, "-o", sol_bin, "-lm"])
-                if res.returncode != 0:
-                    return {
-                        "status": "CE",
-                        "error_log": f"Model Solution компиляцийн алдаа:\n{res.stderr}",
-                        "results": []
-                    }
-                    
-            # Compile custom checker if it exists
-            checker_bin = None
-            if checker_code:
-                chk_src = os.path.join(temp_dir, "checker.cpp")
-                chk_bin = os.path.join(temp_dir, "checker.out")
-                with open(chk_src, "w", encoding="utf-8") as f:
-                    f.write(checker_code)
-                # Copy testlib.h
-                testlib_path = "/usr/include/testlib.h"
-                if os.path.exists(testlib_path):
-                    shutil.copy(testlib_path, os.path.join(temp_dir, "testlib.h"))
-                res = subprocess_run(["g++", "-O3", "-std=c++17", chk_src, "-o", chk_bin])
-                if res.returncode == 0:
-                    checker_bin = chk_bin
-                else:
-                    logger.error(f"Draft custom checker compile failed: {res.stderr}")
-                    
-            # Run testcases
-            test_results = []
-            overall_status = "AC"
-            
-            for idx, tc in enumerate(flat_cases, start=1):
-                in_file = tc["in"]
-                out_file = tc["out"]
-                points = tc["points"]
-                
-                # Read input and expected output content from drafts
-                try:
-                    in_data = _read_draft_file(user_id, code, in_file)
-                    exp_data = _read_draft_file(user_id, code, out_file)
-                except Exception as e:
-                    test_results.append({
-                        "id": idx,
-                        "input_file": in_file,
-                        "output_file": out_file,
-                        "status": "RTE",
-                        "time_ms": 0,
-                        "memory_kb": 0,
-                        "checker_output": f"Тест файлыг уншихад алдаа гарлаа: {str(e)}"
-                    })
-                    overall_status = "RTE"
-                    continue
-                    
-                # Run local judge subprocess
-                from app.services.local_judge import LocalSubprocessJudge
-                
-                # Run the testcase
-                run_cmd = [sol_bin]
-                tc_status, execution_time_ms, memory_used_kb, error_log, stdout_data = LocalSubprocessJudge.execute_testcase(
-                    run_cmd=run_cmd,
-                    input_data=in_data,
-                    expected_output=exp_data,
-                    time_limit_sec=time_limit,
-                    memory_limit_mb=memory_limit,
-                    work_dir=temp_dir,
-                    checker_bin=checker_bin
-                )
-                
-                if tc_status != "AC" and overall_status == "AC":
-                    overall_status = tc_status
-                    
-                test_results.append({
-                    "id": idx,
-                    "input_file": in_file,
-                    "output_file": out_file,
-                    "status": tc_status,
-                    "time_ms": round(execution_time_ms, 2),
-                    "memory_kb": round(memory_used_kb, 2),
-                    "checker_output": error_log or ""
-                })
-                
-            return {
-                "status": overall_status,
-                "error_log": None,
-                "results": test_results
-            }
-            
-    try:
-        verdict = await anyio.to_thread.run_sync(_test)
-        return verdict
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        logger.exception(f"Error testing draft solution: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/judge-jobs/{job_id}")
+async def get_workspace_judge_job(
+    job_id: int,
+    current_user: User = Depends(require_role("teacher", "admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(WorkspaceJudgeJob).where(WorkspaceJudgeJob.id == job_id)
+    )
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Workspace judge job олдсонгүй.")
+    is_admin = getattr(getattr(current_user, "role", None), "value", None) == "admin"
+    if job.user_id != current_user.id and not is_admin:
+        raise HTTPException(status_code=403, detail="Энэ judge job-д хандах эрхгүй.")
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "result": job.result,
+        "error_log": job.error_log,
+        "created_at": job.created_at,
+        "started_at": job.started_at,
+        "finished_at": job.finished_at,
+    }

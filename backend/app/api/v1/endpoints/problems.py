@@ -522,8 +522,12 @@ async def upload_testcases_zip(
 
     try:
         zf = zipfile.ZipFile(io.BytesIO(content))
-    except zipfile.BadZipFile:
-        raise HTTPException(status_code=400, detail="Дотоодгүй ZIP файл.")
+        from app.services.safe_archive import validate_zip
+
+        validate_zip(zf)
+    except (zipfile.BadZipFile, ValueError) as exc:
+        zf.close() if "zf" in locals() else None
+        raise HTTPException(status_code=400, detail=f"Хүчингүй ZIP файл: {exc}")
 
     names = zf.namelist()
     # Дүгнэлт зохицгүй файлуудыг шүүх
@@ -802,8 +806,16 @@ async def upload_problem_package(
     contents = await file.read()
     if not zipfile.is_zipfile(io.BytesIO(contents)):
         raise HTTPException(status_code=400, detail="Илгээсэн файл зөв ZIP архив биш байна.")
-        
-    with zipfile.ZipFile(io.BytesIO(contents)) as z:
+
+    from app.services.safe_archive import open_validated_zip
+
+    try:
+        with open_validated_zip(contents):
+            pass
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Хүчингүй ZIP багц: {exc}")
+
+    with open_validated_zip(contents) as z:
         namelist = z.namelist()
         
         # Шаардлагатай файлуудыг баталгаажуулах
@@ -987,87 +999,20 @@ async def serve_problem_asset(
         raise HTTPException(status_code=404, detail="Asset олдсонгүй.")
 
 
-@router.post("/{code}/run-samples", response_model=RunSamplesResponse, summary="Бодлогын жишээ тестүүдийг ephemeral байдлаар шүүж хариуг шууд буцаах (баазад илгээлт болж орохгүй)")
+@router.post("/{code}/run-samples", summary="Deprecated: жишээ тестийг submission queue ашиглан ажиллуулна")
 async def run_samples(
     code: str,
     req: RunSamplesRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    code = code.upper()
-    problem = await _get_problem_or_404(code, db)
-    
-    # 1. Жишээ тестүүдийг баазаас авах
-    tc_result = await db.execute(
-        select(TestCase)
-        .where(TestCase.problem_id == problem.id, TestCase.is_sample == True)
-        .order_by(TestCase.order.asc())
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "Unsafe synchronous sample runner хаагдсан. "
+            "POST /api/v1/submissions руу is_sample_test=true утгатай илгээнэ үү."
+        ),
     )
-    db_samples = tc_result.scalars().all()
-    
-    tc_list = []
-    for s in db_samples:
-        tc_list.append({
-            "id": s.id,
-            "input_data": s.input_data or "",
-            "output_data": s.output_data or "",
-            "points": s.points
-        })
-        
-    if not tc_list:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Энэ бодлогод жишээ тест оруулаагүй байна."
-        )
-        
-    # Checker унших
-    checker_code = None
-    checker_type = "default"
-    if getattr(problem, 'testcases_zip_key', None):
-        from pathlib import Path
-        local_dir = Path("/problems") / f"oj-{problem.code}"
-        chk_cpp = local_dir / "checker.cpp"
-        if chk_cpp.exists():
-            try:
-                checker_code = chk_cpp.read_text(encoding="utf-8")
-                checker_type = "cpp"
-            except Exception:
-                pass
-                
-    # 2. Local subprocess ашиглан шүүх
-    from app.services.local_judge import LocalSubprocessJudge
-    
-    def run_grade():
-        return LocalSubprocessJudge.grade_submission(
-            language=req.language,
-            source_code=req.source_code,
-            test_cases=tc_list,
-            time_limit_sec=problem.time_limit,
-            memory_limit_mb=problem.memory_limit,
-            checker_code=checker_code,
-            checker_type=checker_type
-        )
-        
-    verdict = await anyio.to_thread.run_sync(run_grade)
-    
-    # 3. Үр дүнг буцаах
-    return {
-        "status": verdict.get("status", "RTE"),
-        "time_ms": verdict.get("time_ms", 0.0),
-        "memory_kb": verdict.get("memory_kb", 0.0),
-        "testcases": [
-            {
-                "testcase_id": tc_res.get("testcase_id"),
-                "status": tc_res.get("status"),
-                "time_ms": tc_res.get("time_ms", 0.0),
-                "memory_kb": tc_res.get("memory_kb", 0.0),
-                "actual_output": tc_res.get("actual_output"),
-                "checker_output": tc_res.get("checker_output"),
-            }
-            for tc_res in verdict.get("test_results", [])
-        ]
-    }
-
 
 @router.get("/{code}/export", summary="Бодлогыг зөөврийн ZIP багц болгон экспортлох (Teacher / Admin)")
 async def export_problem(
@@ -1175,7 +1120,9 @@ async def import_problem(
     zip_buffer = io.BytesIO(contents)
     
     try:
-        with zipfile.ZipFile(zip_buffer, "r") as z:
+        from app.services.safe_archive import open_validated_zip
+
+        with open_validated_zip(contents) as z:
             if "problem.json" not in z.namelist():
                 raise HTTPException(status_code=400, detail="ZIP багцад 'problem.json' файл олдсонгүй.")
                 
@@ -1317,10 +1264,9 @@ async def import_problem(
                 "solved_status": "unsolved"
             }
             
-    except zipfile.BadZipFile:
-        raise HTTPException(status_code=400, detail="Хүчингүй ZIP файл байна.")
+    except (zipfile.BadZipFile, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Хүчингүй ZIP файл: {exc}")
     except Exception as e:
         import logging
         logging.getLogger(__name__).error(f"Error importing problem package: {e}")
         raise HTTPException(status_code=500, detail=f"Бодлого импортлоход алдаа гарлаа: {str(e)}")
-

@@ -121,6 +121,9 @@ SUPPORTED_LANGUAGES = {
     "node":    "JavaScript (Node.js)",
     # C#
     "mono-csc": "C# (Mono)",
+    # Visual Languages for beginners
+    "flowgorithm": "Flowgorithm Flowchart",
+    "scratch": "Scratch Block Code",
 }
 
 
@@ -176,246 +179,19 @@ async def submit_code(
     await db.commit()
     await db.refresh(sub)
 
-    # ── Local Sandbox эсвэл DMOJ Bridge-ээр шүүх ──
-    from app.core.config import settings
-    from app.services.local_judge import LocalSubprocessJudge
-    from app.models.problem import TestCase
-    import os
-    
-    enable_judge = os.getenv("ENABLE_JUDGE", "false").lower() == "true"
-    
-    if payload.is_sample_test or not enable_judge:
-        # DB-ээс тестүүд авах
-        if payload.is_sample_test:
-            tc_result = await db.execute(
-                select(TestCase)
-                .where(TestCase.problem_id == problem.id, TestCase.is_sample == True)
-                .order_by(TestCase.order)
-            )
-            test_cases = tc_result.scalars().all()
-        else:
-            tc_result = await db.execute(
-                select(TestCase)
-                .where(TestCase.problem_id == problem.id)
-                .order_by(TestCase.order)
-            )
-            test_cases = tc_result.scalars().all()
-            
-        # Дискнээс оролт/гаралтын файлуудыг сэргээж унших (хэрэв DB-д None байвал)
-        from app.services.local_judge import LocalSubprocessJudge
-        test_cases = LocalSubprocessJudge.resolve_testcase_data_from_disk(
-            problem_code=problem.code,
-            testcases_zip_key=getattr(problem, "testcases_zip_key", None),
-            test_cases=list(test_cases)
-        )
-            
-        # RUNNING төлөв рүү шилжих
-        sub.status = SubmissionStatus.RUNNING
-        await db.commit()
-        await db.refresh(sub)
-        
-        tc_list = [
-            {"id": tc.id, "input_data": tc.input_data or "", "output_data": tc.output_data or "", "points": tc.points}
-            for tc in test_cases
-        ]
-        
-        # FastAPI thread-pool дотор ажиллуулах
-        import anyio
-        def run_grade():
-            nonlocal tc_list
-            checker_code = None
-            checker_type = None
-            
-            # Хэрэв DB-д тест кэйс байхгүй боловч cases.zip байвал
-            if not tc_list and getattr(problem, 'testcases_zip_key', None):
-                from app.workers.judge_worker import _ensure_problem_testcases
-                from pathlib import Path
-                from app.api.v1.endpoints.problems import parse_simple_yaml
-                
-                try:
-                    _ensure_problem_testcases(problem.code, problem.testcases_zip_key)
-                    local_dir = Path("/problems") / f"oj-{problem.code}"
-                    init_file = local_dir / "init.yml"
-                    
-                    if init_file.exists():
-                        init_cfg = parse_simple_yaml(init_file.read_text(encoding="utf-8"))
-                        testcases_cfg = init_cfg.get("test_cases", [])
-                        
-                        is_nested = len(testcases_cfg) > 0 and "cases" in testcases_cfg[0]
-                        if is_nested:
-                            for s_idx, subtask in enumerate(testcases_cfg, start=1):
-                                sub_points = int(subtask.get("points", 10))
-                                sub_cases_cfg = subtask.get("cases", [])
-                                sub_cases = []
-                                
-                                for idx, tc in enumerate(sub_cases_cfg, start=1):
-                                    in_file = tc.get("in")
-                                    out_file = tc.get("out")
-                                    
-                                    in_path = local_dir / in_file if in_file else None
-                                    out_path = local_dir / out_file if out_file else None
-                                    if in_path and not in_path.exists():
-                                        in_path = local_dir / "cases" / in_file
-                                    if out_path and not out_path.exists():
-                                        out_path = local_dir / "cases" / out_file
-                                        
-                                    input_data = ""
-                                    output_data = ""
-                                    if in_path and in_path.exists():
-                                        input_data = in_path.read_text(encoding="utf-8", errors="replace")
-                                    if out_path and out_path.exists():
-                                        output_data = out_path.read_text(encoding="utf-8", errors="replace")
-                                        
-                                    sub_cases.append({
-                                        "id": (s_idx * 100) + idx,
-                                        "input_data": input_data,
-                                        "output_data": output_data
-                                    })
-                                
-                                tc_list.append({
-                                    "subtask_id": s_idx,
-                                    "points": sub_points,
-                                    "cases": sub_cases
-                                })
-                        else:
-                            for idx, tc in enumerate(testcases_cfg, start=1):
-                                in_file = tc.get("in")
-                                out_file = tc.get("out")
-                                points = int(tc.get("points", 10))
-                                
-                                in_path = local_dir / in_file if in_file else None
-                                out_path = local_dir / out_file if out_file else None
-                                if in_path and not in_path.exists():
-                                    in_path = local_dir / "cases" / in_file
-                                if out_path and not out_path.exists():
-                                    out_path = local_dir / "cases" / out_file
-                                    
-                                input_data = ""
-                                output_data = ""
-                                if in_path and in_path.exists():
-                                    input_data = in_path.read_text(encoding="utf-8", errors="replace")
-                                if out_path and out_path.exists():
-                                    output_data = out_path.read_text(encoding="utf-8", errors="replace")
-                                    
-                                tc_list.append({
-                                    "id": idx,
-                                    "input_data": input_data,
-                                    "output_data": output_data,
-                                    "points": points
-                                })
-                except Exception:
-                    pass
-            
-            # Checker унших
-            if getattr(problem, 'testcases_zip_key', None):
-                from pathlib import Path
-                local_dir = Path("/problems") / f"oj-{problem.code}"
-                chk_cpp = local_dir / "checker.cpp"
-                if chk_cpp.exists():
-                    try:
-                        checker_code = chk_cpp.read_text(encoding="utf-8")
-                        checker_type = "cpp"
-                    except Exception:
-                        pass
-                        
-            return LocalSubprocessJudge.grade_submission(
-                language=sub.language,
-                source_code=sub.source_code,
-                test_cases=tc_list,
-                time_limit_sec=problem.time_limit,
-                memory_limit_mb=problem.memory_limit,
-                checker_code=checker_code,
-                checker_type=checker_type
-            )
-        verdict = await anyio.to_thread.run_sync(run_grade)
-        
-        # Дүнгүүдийг шинэчлэх
-        status_map = {
-            "AC":  SubmissionStatus.ACCEPTED,
-            "WA":  SubmissionStatus.WRONG_ANSWER,
-            "TLE": SubmissionStatus.TIME_LIMIT,
-            "MLE": SubmissionStatus.MEMORY_LIMIT,
-            "RTE": SubmissionStatus.RUNTIME_ERROR,
-            "CE":  SubmissionStatus.COMPILATION_ERROR,
-        }
-        
-        sub.status = status_map.get(verdict.get("status", "RTE"), SubmissionStatus.RUNTIME_ERROR)
-        sub.score = verdict.get("score", 0)
-        sub.time_ms = verdict.get("time_ms", 0.0)
-        sub.memory_kb = verdict.get("memory_kb", 0.0)
-        sub.error_log = verdict.get("error_log")
-        
-        # Хуучин дүн байвал цэвэрлэх
-        from sqlalchemy import delete
-        await db.execute(delete(JudgeResult).where(JudgeResult.submission_id == sub.id))
-        
-        # Жишээ тестүүдийн ID-г авах
-        sample_tc_result = await db.execute(
-            select(TestCase.id)
-            .where(TestCase.problem_id == problem.id, TestCase.is_sample == True)
-        )
-        sample_tc_ids = set(sample_tc_result.scalars().all())
-        
-        for tc_res in verdict.get("test_results", []):
-            tc_id = tc_res.get("testcase_id", 0)
-            # Зөвхөн жишээ тест эсвэл жишээ ажиллуулах горимд гаралт хадгална
-            save_actual = tc_res.get("actual_output") if (tc_id in sample_tc_ids or sub.is_sample_test) else None
-            
-            jr = JudgeResult(
-                submission_id=sub.id,
-                testcase_id=tc_id,
-                status=status_map.get(tc_res.get("status", "WA"), SubmissionStatus.WRONG_ANSWER),
-                time_ms=tc_res.get("time_ms", 0.0),
-                memory_kb=tc_res.get("memory_kb", 0.0),
-                output_log=tc_res.get("checker_output"),
-                actual_output=save_actual
-            )
-            db.add(jr)
-            
-        await db.commit()
-        await db.refresh(sub)
-        
-        # Redis Pub/Sub-д цацах (websocket)
-        try:
-            import redis, json
-            r = redis.from_url(settings.REDIS_URL, decode_responses=True)
-            payload_redis = {
-                "submission_id": sub.id,
-                "status": sub.status.value,
-                "score": sub.score,
-                "time_ms": sub.time_ms,
-                "memory_kb": sub.memory_kb,
-                "judge_results": [
-                    {
-                        "id": jr.id,
-                        "testcase_id": jr.testcase_id,
-                        "status": jr.status.value,
-                        "time_ms": jr.time_ms,
-                        "memory_kb": jr.memory_kb,
-                        "output_log": jr.output_log,
-                        "actual_output": jr.actual_output
-                    }
-                    for jr in sorted(sub.judge_results, key=lambda r: r.id)
-                ]
-            }
-            r.publish(f"submission:{sub.id}", json.dumps(payload_redis))
-        except Exception:
-            pass
-    else:
-        # Celery Judge Queue-д оруулах
-        celery_app.send_task(
-            "app.workers.judge_worker.execute_submission",
-            args=[sub.id],
-            queue="judge_queue",
-        )
-
+    # User-controlled code must never execute inside the API process. Sample
+    # runs use the same isolated judge queue as full submissions.
+    celery_app.send_task(
+        "app.workers.judge_worker.execute_submission",
+        args=[sub.id],
+        queue="judge_queue",
+    )
     return {
         "submission_id": sub.id,
-        "status":        sub.status.value,
-        "message":       "Илгээлтийг хүлээн авлаа. Judge Queue-д орлоо.",
-        "poll_url":      f"/api/v1/submissions/{sub.id}",
+        "status": sub.status.value,
+        "message": "Илгээлтийг хүлээн авч, тусгаарлагдсан Judge Queue-д орууллаа.",
+        "poll_url": f"/api/v1/submissions/{sub.id}",
     }
-
 
 # ─── GET /submissions/{id} ────────────────────────────────────────────────────
 

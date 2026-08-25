@@ -18,7 +18,7 @@ import { Badge } from "@/components/ui/badge";
 import Link from "next/link";
 import toast from "react-hot-toast";
 import { RoleGate } from "@/components/role-gate";
-import { workspaceApi } from "@/lib/api/workspace";
+import { workspaceApi, type WorkspaceTestResult, type WorkspaceVerifyResult } from "@/lib/api/workspace";
 import { problemApi } from "@/lib/api/problems";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 
@@ -57,7 +57,7 @@ export default function ProblemWorkspacePage() {
 
   // Solution verification states
   const [isVerifying, setIsVerifying] = useState<boolean>(false);
-  const [verifyResult, setVerifyResult] = useState<{ status: string; error_log: string | null; results: any[] } | null>(null);
+  const [verifyResult, setVerifyResult] = useState<WorkspaceVerifyResult | null>(null);
 
   // Publish Metadata Form
   const [metadata, setMetadata] = useState({
@@ -185,7 +185,7 @@ export default function ProblemWorkspacePage() {
       setActiveFile("init.yml");
     },
     onError: (err: any) => {
-      const msg = err.response?.data?.detail || "Тест үүсгэхэд алдаа гарлаа.";
+      const msg = err.response?.data?.detail || err.message || "Тест үүсгэхэд алдаа гарлаа.";
       toast.error(msg);
     }
   });
@@ -752,10 +752,10 @@ export default function ProblemWorkspacePage() {
                         {/* Testcase results list */}
                         {verifyResult.results && verifyResult.results.length > 0 && (
                           <div className="space-y-1.5 max-h-72 overflow-y-auto scrollbar-thin pr-1">
-                            {verifyResult.results.map((res: any) => (
-                              <div key={res.id} className="bg-white/5 border border-white/5 rounded-xl p-2.5 space-y-1 text-[10px]">
+                            {verifyResult.results.map((res: WorkspaceTestResult) => (
+                              <div key={res.testcase_id} className="bg-white/5 border border-white/5 rounded-xl p-2.5 space-y-1 text-[10px]">
                                 <div className="flex items-center justify-between">
-                                  <span className="font-mono font-bold text-muted-foreground">#{res.id} ({res.input_file.split('/').pop()})</span>
+                                  <span className="font-mono font-bold text-muted-foreground">Тест #{res.testcase_id}</span>
                                   <span className={`px-1.5 py-0.2 rounded font-mono font-bold text-[9px] ${
                                     res.status === "AC" ? "text-emerald-500 bg-emerald-500/10" : "text-rose-500 bg-rose-500/10"
                                   }`}>

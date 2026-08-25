@@ -10,6 +10,7 @@ from app.models.contest import Contest, ContestProblem, ContestParticipant, Team
 from app.models.ai_curator import TopicDataPool, CuratorDataStatus
 from app.models.verification_token import VerificationToken
 from app.models.system_setting import SystemSetting
+from app.models.workspace_job import WorkspaceJudgeJob
 
 __all__ = [
     "User",
@@ -52,4 +53,5 @@ __all__ = [
     "CuratorDataStatus",
     "VerificationToken",
     "SystemSetting",
+    "WorkspaceJudgeJob",
 ]

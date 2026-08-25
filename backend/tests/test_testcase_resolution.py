@@ -3,7 +3,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
-from app.services.local_judge import LocalSubprocessJudge
+from app.services.testcase_resolver import resolve_testcase_data_from_disk
 
 class MockProblem:
     def __init__(self, code, zip_key):
@@ -50,7 +50,7 @@ test_cases:
     (local_dir / "cases_extracted.txt").write_text(problem.testcases_zip_key, encoding="utf-8")
     
     try:
-        resolved = LocalSubprocessJudge.resolve_testcase_data_from_disk(
+        resolved = resolve_testcase_data_from_disk(
             problem_code=problem.code,
             testcases_zip_key=problem.testcases_zip_key,
             test_cases=test_cases

@@ -51,8 +51,7 @@ def execute_submission(self, submission_id: int):
     """
     Celery Task: submission_id-р тухайн кодыг Judge-д явуулж дүнг DB-д хадгалах.
     """
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker, selectinload
+    from datetime import datetime, timedelta
     from app.models.submission import Submission, JudgeResult, SubmissionStatus
     from app.models.problem import Problem, TestCase
     from app.models.progression import StudentProgress
@@ -60,13 +59,54 @@ def execute_submission(self, submission_id: int):
     # Sync session reuse
     with _get_sync_session() as db:
         # Submission авах
-        sub = db.query(Submission).filter(Submission.id == submission_id).first()
+        sub = (
+            db.query(Submission)
+            .filter(Submission.id == submission_id)
+            .with_for_update()
+            .first()
+        )
         if not sub:
             logger.error(f"Submission {submission_id} олдсонгүй.")
+            return
+        now = datetime.utcnow()
+        if sub.status == SubmissionStatus.RUNNING:
+            lease_active = (
+                sub.judge_lease_expires_at is not None
+                and sub.judge_lease_expires_at > now
+            )
+            redelivered = bool(
+                (getattr(self.request, "delivery_info", None) or {}).get("redelivered")
+            )
+            if lease_active and redelivered:
+                countdown = max(
+                    1,
+                    int((sub.judge_lease_expires_at - now).total_seconds()) + 1,
+                )
+                raise self.retry(
+                    exc=RuntimeError("Submission is still protected by an active judge lease."),
+                    countdown=countdown,
+                )
+            if lease_active:
+                logger.info(
+                    "Ignoring concurrent duplicate delivery for submission %s.",
+                    submission_id,
+                )
+                return
+            logger.warning("Reclaiming expired judge lease for submission %s.", submission_id)
+        elif sub.status != SubmissionStatus.PENDING:
+            logger.info(
+                "Ignoring duplicate/stale delivery for submission %s in status %s",
+                submission_id,
+                sub.status.value,
+            )
             return
 
         # RUNNING статус руу шилжих
         sub.status = SubmissionStatus.RUNNING
+        sub.judge_attempt = int(sub.judge_attempt or 0) + 1
+        sub.judge_started_at = now
+        sub.judge_finished_at = None
+        sub.judge_lease_expires_at = now + timedelta(seconds=settings.JUDGE_LEASE_SECONDS)
         db.commit()
 
         try:
@@ -87,46 +127,60 @@ def execute_submission(self, submission_id: int):
                     .all()
                 )
 
+            if getattr(problem, "testcases_zip_key", None):
+                _ensure_problem_testcases(problem.code, problem.testcases_zip_key)
+
             # Дискнээс оролт/гаралтын файлуудыг сэргээж унших (хэрэв DB-д None байвал)
-            from app.services.local_judge import LocalSubprocessJudge
-            test_cases = LocalSubprocessJudge.resolve_testcase_data_from_disk(
+            from app.services.testcase_resolver import resolve_testcase_data_from_disk
+            test_cases = resolve_testcase_data_from_disk(
                 problem_code=problem.code,
                 testcases_zip_key=getattr(problem, "testcases_zip_key", None),
                 test_cases=list(test_cases)
             )
 
             if not test_cases and not getattr(problem, 'testcases_zip_key', None):
-                # TestCase байхгүй — mock AC буцаах
-                sub.status = SubmissionStatus.ACCEPTED
-                sub.score  = problem.points if problem else 10
-                sub.time_ms = 10.0
-                db.commit()
-                _publish_result(submission_id, sub.status.value, sub.score, sub.time_ms, sub.memory_kb, [])
-                return
+                raise ValueError(
+                    f"Problem {getattr(problem, 'code', sub.problem_id)} has no judge test cases."
+                )
 
-            if ENABLE_JUDGE and not getattr(sub, 'is_sample_test', False):
-                # ── Бодит DMOJ Bridge дуудлага ─────────────────────────────────
-                if getattr(problem, 'testcases_zip_key', None):
-                    _ensure_problem_testcases(problem.code, problem.testcases_zip_key)
-                    _judge_via_dmoj(db, sub, problem, None)
-                else:
-                    _judge_via_dmoj(db, sub, problem, test_cases)
+            testcase_count = len(test_cases) if test_cases else 100
+            required_lease = max(
+                settings.JUDGE_LEASE_SECONDS,
+                int(float(problem.time_limit) * testcase_count) + 120,
+            )
+            sub.judge_lease_expires_at = datetime.utcnow() + timedelta(seconds=required_lease)
+            db.commit()
+
+            if not ENABLE_JUDGE:
+                raise RuntimeError(
+                    "Judge service is disabled; refusing to execute user code in the worker container."
+                )
+
+            exec_language, exec_source = _prepare_submission_source(sub)
+            if getattr(problem, 'testcases_zip_key', None) and not getattr(sub, 'is_sample_test', False):
+                _judge_via_dmoj(db, sub, problem, None, exec_language, exec_source)
             else:
-                # ── Локал Sandbox Шүүлт (Subprocess эсвэл Sample Run) ──────────
-                _run_local_judge(db, sub, problem, test_cases)
+                _judge_via_dmoj(db, sub, problem, test_cases, exec_language, exec_source)
 
             # XP + Gamification шинэчлэлт
             if sub.status == SubmissionStatus.ACCEPTED:
-                _award_xp(db, sub.user_id, problem)
+                _award_xp(db, sub.user_id, problem, submission=sub)
 
             # Тэмцээний standings шинэчлэлт (оноо авсан бол)
             _update_contest_scoreboard(db, problem.id, sub)
+            db.commit()
 
             # Session хаахаас өмнө утгыг cache хийх
             _final_status = sub.status.value
             _final_score  = sub.score
             _final_time_ms = sub.time_ms
             _final_memory_kb = sub.memory_kb
+            final_results = (
+                db.query(JudgeResult)
+                .filter(JudgeResult.submission_id == sub.id)
+                .order_by(JudgeResult.id)
+                .all()
+            )
             _final_judge_results = [
                 {
                     "id": jr.id,
@@ -136,236 +190,47 @@ def execute_submission(self, submission_id: int):
                     "memory_kb": jr.memory_kb,
                     "output_log": jr.output_log
                 }
-                for jr in sorted(sub.judge_results, key=lambda r: r.id)
+                for jr in final_results
             ]
 
         except Exception as exc:
             logger.exception(f"Judge task алдаа гарлаа: {exc}")
-            sub.status    = SubmissionStatus.RUNTIME_ERROR
+            db.rollback()
+            final_attempt = self.request.retries >= self.max_retries
+            sub.status = (
+                SubmissionStatus.SYSTEM_ERROR
+                if final_attempt
+                else SubmissionStatus.PENDING
+            )
             sub.error_log = str(exc)
+            sub.judge_lease_expires_at = None
+            if final_attempt:
+                sub.judge_finished_at = datetime.utcnow()
             db.commit()
-            _final_status = "RTE"
+            _final_status = sub.status.value
             _final_score  = 0
             _final_time_ms = 0.0
             _final_memory_kb = 0.0
             _final_judge_results = []
-            raise self.retry(exc=exc)
+            if not final_attempt:
+                raise self.retry(exc=exc)
 
     # Redis Pub/Sub-д мэдэгдэл илгээх (session хаалтаас гадна)
     _publish_result(submission_id, _final_status, _final_score, _final_time_ms, _final_memory_kb, _final_judge_results)
 
 
 
-def _run_local_judge(db, sub, problem, test_cases):
-    """
-    DMOJ Bridge ашиглахгүйгээр локал subprocess ашиглан кодыг шалгаж үнэлэх.
-    """
-    import os
-    import zipfile
-    import io
-    from pathlib import Path
-    from app.services.local_judge import LocalSubprocessJudge
-    from app.models.submission import Submission, JudgeResult, SubmissionStatus
-    
-    tc_list = []
-    
-    # 1. DB-д тест кэйсүүд байвал ашиглана
-    if test_cases:
-        for tc in test_cases:
-            tc_list.append({
-                "id": tc.id,
-                "input_data": tc.input_data or "",
-                "output_data": tc.output_data or "",
-                "points": tc.points
-            })
-            
-    # 2. DB-д тест кэйс байхгүй боловч cases.zip байвал (багцлагдсан бодлого)
-    elif getattr(problem, 'testcases_zip_key', None):
-        _ensure_problem_testcases(problem.code, problem.testcases_zip_key)
-        local_dir = Path("/problems") / f"oj-{problem.code}"
-        init_file = local_dir / "init.yml"
-        
-        if init_file.exists():
-            try:
-                # problems.py доторх YAML parse-ийг дуудах
-                from app.api.v1.endpoints.problems import parse_simple_yaml
-                init_cfg = parse_simple_yaml(init_file.read_text(encoding="utf-8"))
-                testcases_cfg = init_cfg.get("test_cases", [])
-                
-                is_nested = len(testcases_cfg) > 0 and "cases" in testcases_cfg[0]
-                if is_nested:
-                    for s_idx, subtask in enumerate(testcases_cfg, start=1):
-                        sub_points = int(subtask.get("points", 10))
-                        sub_cases_cfg = subtask.get("cases", [])
-                        sub_cases = []
-                        
-                        for idx, tc in enumerate(sub_cases_cfg, start=1):
-                            in_file = tc.get("in")
-                            out_file = tc.get("out")
-                            
-                            in_path = local_dir / in_file if in_file else None
-                            out_path = local_dir / out_file if out_file else None
-                            if in_path and not in_path.exists():
-                                in_path = local_dir / "cases" / in_file
-                            if out_path and not out_path.exists():
-                                out_path = local_dir / "cases" / out_file
-                                
-                            input_data = ""
-                            output_data = ""
-                            if in_path and in_path.exists():
-                                input_data = in_path.read_text(encoding="utf-8", errors="replace")
-                            if out_path and out_path.exists():
-                                output_data = out_path.read_text(encoding="utf-8", errors="replace")
-                                
-                            sub_cases.append({
-                                "id": (s_idx * 100) + idx,
-                                "input_data": input_data,
-                                "output_data": output_data
-                            })
-                        
-                        tc_list.append({
-                            "subtask_id": s_idx,
-                            "points": sub_points,
-                            "cases": sub_cases
-                        })
-                else:
-                    for idx, tc in enumerate(testcases_cfg, start=1):
-                        in_file = tc.get("in")
-                        out_file = tc.get("out")
-                        points = int(tc.get("points", 10))
-                        
-                        in_path = local_dir / in_file if in_file else None
-                        out_path = local_dir / out_file if out_file else None
-                        if in_path and not in_path.exists():
-                            in_path = local_dir / "cases" / in_file
-                        if out_path and not out_path.exists():
-                            out_path = local_dir / "cases" / out_file
-                            
-                        input_data = ""
-                        output_data = ""
-                        if in_path and in_path.exists():
-                            input_data = in_path.read_text(encoding="utf-8", errors="replace")
-                        if out_path and out_path.exists():
-                            output_data = out_path.read_text(encoding="utf-8", errors="replace")
-                            
-                        tc_list.append({
-                            "id": idx,
-                            "input_data": input_data,
-                            "output_data": output_data,
-                            "points": points
-                        })
-            except Exception as e:
-                logger.error(f"Failed to parse local testcases for {problem.code}: {e}")
-                
-    if not tc_list:
-        # Тест кэйс огт байхгүй бол AC буцаана
-        sub.status = SubmissionStatus.ACCEPTED
-        sub.score = problem.points if problem else 10
-        sub.time_ms = 10.0
-        db.commit()
-        return
+def _prepare_submission_source(sub):
+    """Convert supported visual source to a DMOJ runtime language."""
+    if sub.language == "flowgorithm":
+        from app.services.flowgorithm_transpiler import transpile_fprg_to_python
 
-    # 3. Checker шалгах
-    checker_code = None
-    checker_type = None
-    if getattr(problem, 'testcases_zip_key', None):
-        local_dir = Path("/problems") / f"oj-{problem.code}"
-        chk_cpp = local_dir / "checker.cpp"
-        if chk_cpp.exists():
-            try:
-                checker_code = chk_cpp.read_text(encoding="utf-8")
-                checker_type = "cpp"
-            except Exception:
-                pass
+        return "python3", transpile_fprg_to_python(sub.source_code)
+    if sub.language == "scratch":
+        from app.services.scratch_transpiler import transpile_scratch_to_python
 
-    # 4. Шүүлтийг ажиллуулах
-    verdict = LocalSubprocessJudge.grade_submission(
-        language=sub.language,
-        source_code=sub.source_code,
-        test_cases=tc_list,
-        time_limit_sec=problem.time_limit,
-        memory_limit_mb=problem.memory_limit,
-        checker_code=checker_code,
-        checker_type=checker_type
-    )
-    
-    # 4. Шүүлтийн үр дүнг DB-д хадгалах
-    status_map = {
-        "AC":  SubmissionStatus.ACCEPTED,
-        "WA":  SubmissionStatus.WRONG_ANSWER,
-        "TLE": SubmissionStatus.TIME_LIMIT,
-        "MLE": SubmissionStatus.MEMORY_LIMIT,
-        "RTE": SubmissionStatus.RUNTIME_ERROR,
-        "CE":  SubmissionStatus.COMPILATION_ERROR,
-    }
-    
-    sub.status = status_map.get(verdict.get("status", "RTE"), SubmissionStatus.RUNTIME_ERROR)
-    sub.score = verdict.get("score", 0)
-    sub.time_ms = verdict.get("time_ms", 0.0)
-    sub.memory_kb = verdict.get("memory_kb", 0.0)
-    sub.error_log = verdict.get("error_log")
-    
-    # Хуучин шүүлтийн дүнгүүдийг цэвэрлэх
-    from sqlalchemy import delete
-    db.query(JudgeResult).filter(JudgeResult.submission_id == sub.id).delete()
-    
-    # Жишээ тестүүдийн ID-г авах
-    from app.models.problem import TestCase
-    sample_tc_ids = {r[0] for r in db.query(TestCase.id).filter(TestCase.problem_id == problem.id, TestCase.is_sample == True).all()}
-    
-    for tc_res in verdict.get("test_results", []):
-        tc_id = tc_res.get("testcase_id", 0)
-        save_actual = tc_res.get("actual_output") if (tc_id in sample_tc_ids or sub.is_sample_test) else None
-        
-        jr = JudgeResult(
-            submission_id=sub.id,
-            testcase_id=tc_id,
-            status=status_map.get(tc_res.get("status", "WA"), SubmissionStatus.WRONG_ANSWER),
-            time_ms=tc_res.get("time_ms", 0.0),
-            memory_kb=tc_res.get("memory_kb", 0.0),
-            output_log=tc_res.get("checker_output"),
-            actual_output=save_actual
-        )
-        db.add(jr)
-        
-    db.commit()
-
-
-def _mock_judge(db, sub, problem, test_cases):
-    """
-    DMOJ Bridge байхгүй үед бүх test_case-д AC буцаана.
-    Хурдыг санамсаргүй байдлаар тооцно.
-    """
-    import random
-    from app.models.submission import Submission, JudgeResult, SubmissionStatus
-    total_score = 0
-    max_time_ms = 0.0
-    max_memory_kb = 0.0
-
-    for idx, tc in enumerate(test_cases):
-        mock_time   = round(random.uniform(10, problem.time_limit * 800), 2)
-        mock_memory = round(random.uniform(500, 8000), 2)
-        mock_status = SubmissionStatus.ACCEPTED
-
-        jr = JudgeResult(
-            submission_id=sub.id,
-            testcase_id=tc.id,
-            status=mock_status,
-            time_ms=mock_time,
-            memory_kb=mock_memory,
-            actual_output=None
-        )
-        db.add(jr)
-
-        total_score   += tc.points
-        max_time_ms    = max(max_time_ms, mock_time)
-        max_memory_kb  = max(max_memory_kb, mock_memory)
-
-    sub.status    = SubmissionStatus.ACCEPTED
-    sub.score     = total_score
-    sub.time_ms   = max_time_ms
-    sub.memory_kb = max_memory_kb
-    db.commit()
+        return "python3", transpile_scratch_to_python(sub.source_code)
+    return sub.language, sub.source_code
 
 
 # ─── DMOJ Bridge Judge (Phase 2+) ─────────────────────────────────────────────
@@ -407,8 +272,9 @@ def _ensure_problem_testcases(problem_code: str, testcases_zip_key: str):
         shutil.rmtree(local_dir, ignore_errors=True)
         local_dir.mkdir(parents=True, exist_ok=True)
         
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-            z.extractall(local_dir)
+        from app.services.safe_archive import safe_extract_zip
+
+        safe_extract_zip(zip_bytes, local_dir)
             
         # DMOJ-ийн init.yml-ийн "archive: cases.zip" тохиргоонд зориулж zip файлыг бас хадгална
         with open(local_dir / "cases.zip", "wb") as f:
@@ -422,89 +288,112 @@ def _ensure_problem_testcases(problem_code: str, testcases_zip_key: str):
         raise e
 
 
-def _judge_via_dmoj(db, sub, problem, test_cases=None):
+def _judge_via_dmoj(db, sub, problem, test_cases=None, exec_language=None, exec_source=None):
     """
     DMOJ Bridge-тэй харилцах логик (Phase 2).
     ENABLE_JUDGE=true байх үед ажиллана.
     """
-    import socket, json, struct, redis
+    req_data = {
+        "id": sub.id,
+        "problem": problem.code,
+        "language": exec_language or sub.language,
+        "source": exec_source if exec_source is not None else sub.source_code,
+        "time_limit": problem.time_limit,
+        "memory_limit_mb": problem.memory_limit,
+    }
+    if test_cases:
+        req_data["testcases"] = [
+            {"id": tc.id, "input_data": tc.input_data, "output_data": tc.output_data, "points": tc.points}
+            for tc in test_cases
+        ]
+    verdict = _request_dmoj(req_data, f"submission {sub.id}")
+    _apply_dmoj_verdict(db, sub, verdict)
 
-    # Connect to Redis
+
+def _request_dmoj(req_data: dict, task_label: str) -> dict:
+    """Send one bounded request while holding a per-bridge Redis lease."""
+    import json
+    import socket
+    import struct
+
+    import redis
+
     r_client = redis.Redis.from_url(settings.REDIS_URL)
-    hosts = settings.DMOJ_BRIDGE_HOSTS.split(",")
-    
-    # 1. Acquire an idle bridge via Redis queue
-    queue_key = "dmoj:bridge:idle_queue"
-    # Ensure queue exists and is initialized
-    if not r_client.exists(queue_key):
-        # Initialize queue atomically using a transaction
-        with r_client.pipeline() as pipe:
-            pipe.watch(queue_key)
-            if not r_client.exists(queue_key):
-                pipe.multi()
-                pipe.delete(queue_key)
-                pipe.rpush(queue_key, *hosts)
-                pipe.execute()
-            else:
-                pipe.unwatch()
-
-    res = r_client.blpop(queue_key, timeout=60)
-    if not res:
-        raise TimeoutError("Шүүгч серверүүд ачаалалтай байна. Хүлээх хугацаа хэтэрлээ.")
-    
-    assigned_bridge = res[1].decode("utf-8")
-    BRIDGE_PORT = settings.DMOJ_BRIDGE_PORT
-    logger.info(f"Assigned bridge {assigned_bridge} for submission {sub.id}")
+    hosts = [host.strip() for host in settings.DMOJ_BRIDGE_HOSTS.split(",") if host.strip()]
+    if not hosts:
+        raise RuntimeError("No DMOJ bridge hosts configured.")
+    payload = json.dumps(req_data).encode()
+    if len(payload) > 2 * 1024 * 1024:
+        raise ValueError("Judge request exceeds 2MB.")
+    tc_count = len(req_data.get("testcases") or []) or 100
+    request_timeout = max(
+        60,
+        int(float(req_data.get("time_limit", 1.0)) * tc_count + 30),
+    )
+    assigned_bridge, bridge_lock = _acquire_bridge_lease(
+        r_client,
+        hosts,
+        wait_seconds=60,
+        lease_seconds=request_timeout + 60,
+    )
+    logger.info("Assigned bridge %s for %s", assigned_bridge, task_label)
 
     try:
-        sock = socket.create_connection((assigned_bridge, BRIDGE_PORT), timeout=10)
-        
-        # Prepare socket JSON payload
-        req_data = {
-            "id":       sub.id,
-            "problem":  problem.code,
-            "language": sub.language,
-            "source":   sub.source_code,
-            "time_limit": problem.time_limit,
-            "memory_limit_mb": problem.memory_limit,
-        }
-        if test_cases:
-            req_data["testcases"] = [
-                {"id": tc.id, "input_data": tc.input_data, "output_data": tc.output_data, "points": tc.points}
-                for tc in test_cases
-            ]
-            
-        payload = json.dumps(req_data).encode()
-        sock.sendall(struct.pack("!I", len(payload)) + payload)
-        
-        # Timeout calculation
-        tc_count = len(test_cases) if test_cases else 100
-        sock.settimeout(max(60, int(problem.time_limit * max(1, tc_count) + 30)))
-
-        # Response хүлээх
-        header = sock.recv(4)
-        if len(header) < 4:
-            raise ConnectionError("Bridge хариу буцаасангүй.")
-        length = struct.unpack("!I", header)[0]
-        data   = b""
-        while len(data) < length:
-            chunk = sock.recv(length - len(data))
-            if not chunk:
-                break
-            data += chunk
-        sock.close()
-
-        verdict = json.loads(data.decode())
-        _apply_dmoj_verdict(db, sub, verdict)
-
-    except (ConnectionRefusedError, socket.timeout, Exception) as e:
-        logger.warning(f"DMOJ Bridge холболт амжилтгүй: {e}. Mock-руу буцлаа.")
-        _mock_judge(db, sub, problem, test_cases or [])
-
+        with socket.create_connection(
+            (assigned_bridge, settings.DMOJ_BRIDGE_PORT), timeout=10
+        ) as sock:
+            sock.sendall(struct.pack("!I", len(payload)) + payload)
+            sock.settimeout(request_timeout)
+            header = sock.recv(4)
+            if len(header) != 4:
+                raise ConnectionError("Bridge хариу буцаасангүй.")
+            length = struct.unpack("!I", header)[0]
+            if length > 8 * 1024 * 1024:
+                raise ValueError("Judge response exceeds 8MB.")
+            data = b""
+            while len(data) < length:
+                chunk = sock.recv(length - len(data))
+                if not chunk:
+                    raise ConnectionError("Bridge response ended early.")
+                data += chunk
+        return json.loads(data.decode())
+    except Exception:
+        logger.exception("DMOJ Bridge холболт амжилтгүй; fail-closed retry хийнэ.")
+        raise
     finally:
-        # 2. Release the bridge back to queue
-        r_client.rpush(queue_key, assigned_bridge)
-        logger.info(f"Released bridge {assigned_bridge} from submission {sub.id}")
+        try:
+            bridge_lock.release()
+        except Exception:
+            logger.warning("Bridge lease %s expired before release.", assigned_bridge)
+        logger.info("Released bridge lease %s from %s", assigned_bridge, task_label)
+
+
+def _acquire_bridge_lease(
+    redis_client,
+    hosts: list[str],
+    *,
+    wait_seconds: float,
+    lease_seconds: int,
+):
+    """Acquire one bridge without maintaining a stale shared idle-host list."""
+    deadline = time.monotonic() + wait_seconds
+    start = int(redis_client.incr("dmoj:bridge:round_robin")) % len(hosts)
+    while True:
+        for offset in range(len(hosts)):
+            host = hosts[(start + offset) % len(hosts)]
+            lock = redis_client.lock(
+                f"dmoj:bridge:lease:{host}",
+                timeout=lease_seconds,
+                blocking=False,
+                thread_local=False,
+            )
+            if lock.acquire(blocking=False):
+                return host, lock
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Шүүгч серверүүд ачаалалтай байна. Хүлээх хугацаа хэтэрлээ."
+            )
+        time.sleep(0.1)
 
 
 def _apply_dmoj_verdict(db, sub, verdict: dict):
@@ -514,14 +403,22 @@ def _apply_dmoj_verdict(db, sub, verdict: dict):
         "WA":  SubmissionStatus.WRONG_ANSWER,
         "TLE": SubmissionStatus.TIME_LIMIT,
         "MLE": SubmissionStatus.MEMORY_LIMIT,
+        "OLE": SubmissionStatus.OUTPUT_LIMIT,
         "RTE": SubmissionStatus.RUNTIME_ERROR,
         "CE":  SubmissionStatus.COMPILATION_ERROR,
+        "SYSTEM_ERROR": SubmissionStatus.SYSTEM_ERROR,
     }
-    sub.status    = status_map.get(verdict.get("status", "RTE"), SubmissionStatus.RUNTIME_ERROR)
+    sub.status = status_map.get(
+        verdict.get("status", "SYSTEM_ERROR"),
+        SubmissionStatus.SYSTEM_ERROR,
+    )
     sub.score     = verdict.get("score", 0)
     sub.time_ms   = verdict.get("time_ms", 0.0)
     sub.memory_kb = verdict.get("memory_kb", 0.0)
     sub.error_log = verdict.get("error_log")
+    from datetime import datetime
+    sub.judge_lease_expires_at = None
+    sub.judge_finished_at = datetime.utcnow()
 
     for tc_result in verdict.get("test_results", []):
         jr = JudgeResult(
@@ -535,18 +432,432 @@ def _apply_dmoj_verdict(db, sub, verdict: dict):
         )
         db.add(jr)
 
+    db.flush()
+
+
+def _read_workspace_text(user_id: str, problem_code: str, filename: str, max_bytes: int = 1024 * 1024) -> str:
+    """Read a bounded UTF-8 workspace object from MinIO."""
+    from pathlib import PurePosixPath
+
+    from app.services.storage import storage_client
+
+    path = PurePosixPath(filename)
+    if path.is_absolute() or ".." in path.parts or "\\" in filename:
+        raise ValueError(f"Invalid workspace filename: {filename}")
+    key = f"{user_id}/{problem_code.upper()}/{filename}"
+    response = storage_client.client.get_object("oj-workspace-drafts", key)
+    try:
+        data = response.read(max_bytes + 1)
+    finally:
+        response.close()
+        response.release_conn()
+    if len(data) > max_bytes:
+        raise ValueError(f"Workspace file exceeds {max_bytes} bytes: {filename}")
+    return data.decode("utf-8")
+
+
+def _workspace_solution_payload(job) -> dict:
+    """Build a bounded, explicit-testcase DMOJ payload from a teacher draft."""
+    import yaml
+
+    solution = _read_workspace_text(str(job.user_id), job.problem_code, "solution.cpp", 256 * 1024)
+    config_text = _read_workspace_text(str(job.user_id), job.problem_code, "init.yml", 256 * 1024)
+    config = yaml.safe_load(config_text) or {}
+    configured = config.get("test_cases") or []
+    flat_cases = []
+    for item in configured:
+        nested = item.get("cases") if isinstance(item, dict) else None
+        flat_cases.extend(nested if isinstance(nested, list) else [item])
+    if not flat_cases:
+        raise ValueError("Workspace init.yml has no test cases.")
+    if len(flat_cases) > 500:
+        raise ValueError("Workspace judge job exceeds 500 test cases.")
+
+    testcases = []
+    total_testcase_bytes = 0
+    for position, testcase in enumerate(flat_cases, start=1):
+        if not isinstance(testcase, dict) or not testcase.get("in") or not testcase.get("out"):
+            raise ValueError(f"Invalid testcase entry at position {position}.")
+        input_data = _read_workspace_text(str(job.user_id), job.problem_code, str(testcase["in"]))
+        output_data = _read_workspace_text(str(job.user_id), job.problem_code, str(testcase["out"]))
+        total_testcase_bytes += len(input_data.encode("utf-8")) + len(output_data.encode("utf-8"))
+        if total_testcase_bytes > 1536 * 1024:
+            raise ValueError("Workspace testcase payload exceeds 1.5MB.")
+        testcases.append({
+            "id": position,
+            "input_data": input_data,
+            "output_data": output_data,
+            "points": int(testcase.get("points", 10)),
+        })
+
+    return {
+        "id": 1_000_000_000 + int(job.id),
+        "problem": f"workspace-{job.problem_code}",
+        "language": "g++20",
+        "source": solution,
+        "time_limit": min(max(float(config.get("time_limit", 1.0)), 0.1), 30.0),
+        "memory_limit_mb": min(max(int(config.get("memory_limit", 64)), 16), 1024),
+        "testcases": testcases,
+    }
+
+
+def _workspace_generator_payload(job, parameter_index: int = 0) -> dict:
+    """Wrap one testlib parameter row without touching stdin before registerGen."""
+    import json
+    import re
+    import shlex
+
+    request_payload = job.request_payload or {}
+    params = request_payload.get("params") or []
+    if not isinstance(params, list) or not params or len(params) > 20:
+        raise ValueError("Workspace generator requires 1-20 parameter rows.")
+    if parameter_index < 0 or parameter_index >= len(params):
+        raise ValueError("Generator parameter index is out of range.")
+
+    generator = _read_workspace_text(
+        str(job.user_id), job.problem_code, "generator.cpp", 256 * 1024
+    )
+    row = params[parameter_index]
+    if not isinstance(row, str) or not row or len(row.encode("utf-8")) > 256:
+        raise ValueError(f"Invalid generator parameters at row {parameter_index + 1}.")
+    try:
+        args = shlex.split(row, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"Invalid quoting at generator row {parameter_index + 1}.") from exc
+    if len(args) > 20 or any(len(arg.encode("utf-8")) > 128 for arg in args):
+        raise ValueError(f"Generator row {parameter_index + 1} exceeds argument limits.")
+    values = ["generator", *args]
+    declarations = []
+    names = []
+    for arg_index, value in enumerate(values):
+        name = f"workspace_arg_{arg_index}"
+        declarations.append(
+            f"static char {name}[] = {json.dumps(value, ensure_ascii=True)};"
+        )
+        names.append(name)
+    declarations.append(
+        f"static char* workspace_argv[] = {{{', '.join(names)}, nullptr}};"
+    )
+
+    rewritten_generator, replacements = re.subn(
+        r"registerGen\s*\(\s*argc\s*,\s*argv\s*,\s*([01])\s*\)",
+        lambda match: (
+            f"argc={len(values)}; argv=workspace_argv; "
+            f"registerGen(argc,argv,{match.group(1)})"
+        ),
+        generator,
+        count=1,
+    )
+    if replacements != 1:
+        raise ValueError(
+            "generator.cpp must call registerGen(argc, argv, 0|1) in main."
+        )
+    wrapper = "\n".join([*declarations, rewritten_generator])
+    if len(wrapper.encode("utf-8")) > 512 * 1024:
+        raise ValueError("Wrapped generator source exceeds 512KB.")
+
+    return {
+        "id": 1_100_000_000 + int(job.id) * 100 + parameter_index,
+        "problem": f"workspace-generator-{job.problem_code}",
+        "language": "g++20",
+        "source": wrapper,
+        "time_limit": 5.0,
+        "memory_limit_mb": 256,
+        "capture_output": True,
+        "testcases": [
+            {"id": parameter_index + 1, "input_data": "", "output_data": "", "points": 1}
+        ],
+    }
+
+
+def _workspace_solution_capture_payload(job, generated_inputs: list[str]) -> dict:
+    solution = _read_workspace_text(
+        str(job.user_id), job.problem_code, "solution.cpp", 256 * 1024
+    )
+    return {
+        "id": 1_200_000_000 + int(job.id),
+        "problem": f"workspace-solution-{job.problem_code}",
+        "language": "g++20",
+        "source": solution,
+        "time_limit": 5.0,
+        "memory_limit_mb": 256,
+        "capture_output": True,
+        "testcases": [
+            {"id": index + 1, "input_data": data, "output_data": "", "points": 1}
+            for index, data in enumerate(generated_inputs)
+        ],
+    }
+
+
+def _write_workspace_text(user_id: str, problem_code: str, filename: str, content: str) -> None:
+    import io
+
+    from app.services.storage import storage_client
+
+    encoded = content.encode("utf-8")
+    storage_client.client.put_object(
+        "oj-workspace-drafts",
+        f"{user_id}/{problem_code.upper()}/{filename}",
+        io.BytesIO(encoded),
+        length=len(encoded),
+        content_type="text/plain; charset=utf-8",
+    )
+
+
+def _claim_workspace_job(task, job, db) -> bool:
+    """Claim QUEUED or expired RUNNING workspace work under its row lock."""
+    from datetime import datetime, timedelta
+
+    now = datetime.utcnow()
+    if job.status == "RUNNING":
+        lease_active = job.lease_expires_at is not None and job.lease_expires_at > now
+        redelivered = bool(
+            (getattr(task.request, "delivery_info", None) or {}).get("redelivered")
+        )
+        if lease_active and redelivered:
+            countdown = max(1, int((job.lease_expires_at - now).total_seconds()) + 1)
+            raise task.retry(
+                exc=RuntimeError("Workspace job has an active judge lease."),
+                countdown=countdown,
+            )
+        if lease_active:
+            return False
+        logger.warning("Reclaiming expired workspace judge lease for job %s.", job.id)
+    elif job.status != "QUEUED":
+        return False
+    job.status = "RUNNING"
+    job.judge_attempt = int(job.judge_attempt or 0) + 1
+    job.started_at = now
+    job.finished_at = None
+    job.lease_expires_at = now + timedelta(seconds=settings.JUDGE_LEASE_SECONDS)
     db.commit()
+    return True
+
+
+@celery_app.task(
+    name="app.workers.judge_worker.execute_workspace_solution",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=3,
+    queue="judge_queue",
+)
+def execute_workspace_solution(self, job_id: int):
+    """Verify a teacher model solution using the same DMOJ sandbox as submissions."""
+    from datetime import datetime
+
+    from app.models.workspace_job import WorkspaceJudgeJob
+
+    with _get_sync_session() as db:
+        job = (
+            db.query(WorkspaceJudgeJob)
+            .filter(WorkspaceJudgeJob.id == job_id)
+            .with_for_update()
+            .first()
+        )
+        if not job or not _claim_workspace_job(self, job, db):
+            return
+        try:
+            if not ENABLE_JUDGE:
+                raise RuntimeError("Judge service is disabled.")
+            payload = _workspace_solution_payload(job)
+            from datetime import timedelta
+            required_lease = max(
+                settings.JUDGE_LEASE_SECONDS,
+                int(float(payload["time_limit"]) * len(payload["testcases"])) + 120,
+            )
+            job.lease_expires_at = datetime.utcnow() + timedelta(seconds=required_lease)
+            db.commit()
+            verdict = _request_dmoj(payload, f"workspace job {job.id}")
+            if verdict.get("status") == "SYSTEM_ERROR":
+                raise RuntimeError(verdict.get("error_log") or "Judge system error")
+            job.status = "FINAL"
+            job.result = verdict
+            job.error_log = verdict.get("error_log")
+            job.finished_at = datetime.utcnow()
+            job.lease_expires_at = None
+            db.commit()
+            return verdict
+        except Exception as exc:
+            final_attempt = self.request.retries >= self.max_retries
+            job.status = "SYSTEM_ERROR" if final_attempt else "QUEUED"
+            job.error_log = str(exc)
+            job.lease_expires_at = None
+            if final_attempt:
+                job.finished_at = datetime.utcnow()
+            db.commit()
+            if not final_attempt:
+                raise self.retry(exc=exc)
+            return {"status": "SYSTEM_ERROR", "error_log": str(exc), "test_results": []}
+
+
+@celery_app.task(
+    name="app.workers.judge_worker.execute_workspace_generator",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=3,
+    queue="judge_queue",
+)
+def execute_workspace_generator(self, job_id: int):
+    """Generate testcase input/output pairs entirely inside DMOJ sandboxes."""
+    from datetime import datetime
+
+    from app.models.workspace_job import WorkspaceJudgeJob
+
+    with _get_sync_session() as db:
+        job = (
+            db.query(WorkspaceJudgeJob)
+            .filter(WorkspaceJudgeJob.id == job_id)
+            .with_for_update()
+            .first()
+        )
+        if not job or not _claim_workspace_job(self, job, db):
+            return
+        if job.kind != "generate_testcases":
+            job.status = "SYSTEM_ERROR"
+            job.error_log = "Workspace job kind does not match generator task."
+            job.finished_at = datetime.utcnow()
+            job.lease_expires_at = None
+            db.commit()
+            return
+
+        def finish_with_verdict(stage: str, verdict: dict):
+            job.status = "FINAL"
+            job.result = {**verdict, "stage": stage}
+            job.error_log = verdict.get("error_log")
+            job.finished_at = datetime.utcnow()
+            job.lease_expires_at = None
+            db.commit()
+            return job.result
+
+        try:
+            if not ENABLE_JUDGE:
+                raise RuntimeError("Judge service is disabled.")
+
+            from datetime import timedelta
+            expected_count = len((job.request_payload or {}).get("params") or [])
+            required_lease = max(
+                settings.JUDGE_LEASE_SECONDS,
+                expected_count * 5 + 120,
+            )
+            job.lease_expires_at = datetime.utcnow() + timedelta(seconds=required_lease)
+            db.commit()
+
+            generated_inputs = []
+            for parameter_index in range(expected_count):
+                generator_verdict = _request_dmoj(
+                    _workspace_generator_payload(job, parameter_index),
+                    f"workspace generator job {job.id} row {parameter_index + 1}",
+                )
+                if generator_verdict.get("status") == "SYSTEM_ERROR":
+                    raise RuntimeError(generator_verdict.get("error_log") or "Judge system error")
+                if generator_verdict.get("status") != "AC":
+                    generator_verdict["parameter_index"] = parameter_index
+                    return finish_with_verdict("generator", generator_verdict)
+                generator_results = generator_verdict.get("test_results") or []
+                if len(generator_results) != 1:
+                    raise RuntimeError("Generator judge returned an incomplete result set.")
+                generated_inputs.append(str(generator_results[0].get("program_output", "")))
+            total_bytes = sum(len(item.encode("utf-8")) for item in generated_inputs)
+            if any(len(item.encode("utf-8")) > 256 * 1024 for item in generated_inputs):
+                raise ValueError("A generated testcase exceeds 256KB.")
+            if total_bytes > 1536 * 1024:
+                raise ValueError("Generated testcase input exceeds 1.5MB in total.")
+
+            solution_verdict = _request_dmoj(
+                _workspace_solution_capture_payload(job, generated_inputs),
+                f"workspace model solution job {job.id}",
+            )
+            if solution_verdict.get("status") == "SYSTEM_ERROR":
+                raise RuntimeError(solution_verdict.get("error_log") or "Judge system error")
+            if solution_verdict.get("status") != "AC":
+                return finish_with_verdict("solution", solution_verdict)
+
+            solution_results = solution_verdict.get("test_results") or []
+            if len(solution_results) != expected_count:
+                raise RuntimeError("Model solution judge returned an incomplete result set.")
+            solution_results.sort(key=lambda item: int(item.get("testcase_id", 0)))
+            generated_outputs = [str(item.get("program_output", "")) for item in solution_results]
+            total_bytes += sum(len(item.encode("utf-8")) for item in generated_outputs)
+            if any(len(item.encode("utf-8")) > 256 * 1024 for item in generated_outputs):
+                raise ValueError("A generated answer exceeds 256KB.")
+            if total_bytes > 3 * 1024 * 1024:
+                raise ValueError("Generated testcase artifacts exceed 3MB in total.")
+
+            request_payload = job.request_payload or {}
+            points = int(request_payload.get("points_per_case", 10))
+            if points < 1 or points > 1000:
+                raise ValueError("Invalid points_per_case in workspace job.")
+            params = request_payload.get("params") or []
+            case_lines = []
+            cases = []
+            for index, (input_data, output_data) in enumerate(
+                zip(generated_inputs, generated_outputs), start=1
+            ):
+                _write_workspace_text(str(job.user_id), job.problem_code, f"cases/{index}.in", input_data)
+                _write_workspace_text(str(job.user_id), job.problem_code, f"cases/{index}.out", output_data)
+                sample = ", sample: true" if index == 1 else ""
+                case_lines.append(
+                    f"  - {{in: cases/{index}.in, out: cases/{index}.out, points: {points}{sample}}}"
+                )
+                cases.append({"idx": index, "args": params[index - 1]})
+
+            init_content = (
+                "archive: cases.zip\n"
+                "time_limit: 1.0\n"
+                "memory_limit: 64\n"
+                "test_cases:\n" + "\n".join(case_lines) + "\n"
+            )
+            _write_workspace_text(str(job.user_id), job.problem_code, "init.yml", init_content)
+            _write_workspace_text(
+                str(job.user_id), job.problem_code, "generator.params", "\n".join(params)
+            )
+            _write_workspace_text(
+                str(job.user_id), job.problem_code, "generator.points", str(points)
+            )
+
+            result = {
+                "status": "AC",
+                "stage": "complete",
+                "message": f"{expected_count} testcases generated successfully.",
+                "cases": cases,
+            }
+            job.status = "FINAL"
+            job.result = result
+            job.error_log = None
+            job.finished_at = datetime.utcnow()
+            job.lease_expires_at = None
+            db.commit()
+            return result
+        except ValueError as exc:
+            return finish_with_verdict(
+                "validation", {"status": "INVALID_OUTPUT", "error_log": str(exc), "test_results": []}
+            )
+        except Exception as exc:
+            final_attempt = self.request.retries >= self.max_retries
+            job.status = "SYSTEM_ERROR" if final_attempt else "QUEUED"
+            job.error_log = str(exc)
+            job.lease_expires_at = None
+            if final_attempt:
+                job.finished_at = datetime.utcnow()
+            db.commit()
+            if not final_attempt:
+                raise self.retry(exc=exc)
+            return {"status": "SYSTEM_ERROR", "error_log": str(exc), "test_results": []}
 
 
 # ─── XP Engine (Simplified — Phase 2-д бүрэн болгоно) ───────────────────────
 
-def _award_xp(db, user_id, problem):
+def _award_xp(db, user_id, problem, submission=None):
     """AC дүнд XP олгох, Streak шинэчлэх, Түвшин ба Амжилтуудыг шалгах."""
     from datetime import date, datetime
     from app.models.progression import StudentProgress
     
+    if submission is not None and submission.rewards_applied_at is not None:
+        return
     progress = db.query(StudentProgress).filter(StudentProgress.user_id == user_id).first()
     if not progress:
+        if submission is not None:
+            submission.rewards_applied_at = datetime.utcnow()
         return
 
     xp = getattr(problem, "xp_reward", 20)
@@ -575,6 +886,8 @@ def _award_xp(db, user_id, problem):
         progress.highest_streak = progress.current_streak
 
     progress.last_active_date = datetime.utcnow()
+    if submission is not None:
+        submission.rewards_applied_at = datetime.utcnow()
     db.commit()
     logger.info(f"User {user_id}: +{xp} XP, streak={progress.current_streak}")
 
@@ -586,11 +899,19 @@ def _award_xp(db, user_id, problem):
         "total_xp": progress.total_xp
     })
 
-    # Түвшин шалгах
-    _check_level_up(db, progress)
-
-    # Амжилт шалгах
-    _check_achievements(db, progress)
+    # Final verdict + үндсэн XP аль хэдийн нэг transaction-аар commit болсон.
+    # Нэмэлт gamification hook алдаа гаргавал judge task-ийг retry хийж,
+    # terminal submission-ийг буцааж PENDING болгох ёсгүй.
+    for hook in (_check_level_up, _check_achievements):
+        try:
+            hook(db, progress)
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "Post-reward hook %s failed for user %s; judge result remains final.",
+                hook.__name__,
+                user_id,
+            )
 
 
 def _check_level_up(db, progress):

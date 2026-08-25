@@ -22,6 +22,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { problemApi, type Submission, type JudgeResult } from "@/lib/api/problems";
 import { aiTutorApi } from "@/lib/api/ai-tutor";
 import { useWebsocket } from "@/hooks/use-websocket";
+import { VisualIde } from "@/components/visual-ide";
 
 const DEFAULT_CODE: Record<string, string> = {
   "g++20": `#include <iostream>
@@ -595,44 +596,32 @@ export default function ProblemDetailPage() {
     }
   };
 
-  // Run samples ephemeral (WITHOUT saving to PostgreSQL submissions)
+  // Sample runs use the same isolated asynchronous judge pipeline as normal
+  // submissions. The submission is flagged so only public sample cases run.
   const handleRunSample = async () => {
-    setConsoleOpen(true);
-    setSelectedTestCaseId(null);
-    setJudgeResult({ status: "RUNNING", time: "...", memory: "...", score: 0, testcases: [] });
-    try {
-      const verdict = await problemApi.runSamples(code, language, sourceCode);
-      
-      // Update state instantly from direct HTTP response
-      setJudgeResult({
-        status: verdict.status,
-        time: `${verdict.time_ms}ms`,
-        memory: `${verdict.memory_kb}KB`,
-        score: verdict.status === "AC" ? 100 : 0,
-        testcases: verdict.testcases.map((t, idx) => ({
-          id: idx + 1,
-          testcase_id: t.testcase_id,
-          status: t.status,
-          time: `${t.time_ms}ms`,
-          memory: `${t.memory_kb}KB`,
-          actual_output: t.actual_output,
-          output_log: t.checker_output
-        }))
-      });
-      toast.success("Жишээ тестүүдийг ephemeral байдлаар амжилттай шалгалаа.");
-    } catch (e: any) {
-      toast.error(e?.response?.data?.detail || "Жишээ тест ажиллуулахад алдаа гарлаа.");
-      setJudgeResult(null);
-    }
-  };
-
-  const handleSubmitCode = async () => {
     setIsSubmitting(true);
     setConsoleOpen(true);
     setSelectedTestCaseId(null);
     setJudgeResult({ status: "RUNNING", time: "...", memory: "...", score: 0, testcases: [] });
     try {
-      const submission = await problemApi.submit(code, language, sourceCode);
+      const submission = await problemApi.submit(code, language, sourceCode, true);
+      setSubmissionId(submission.submission_id);
+    } catch {
+      setIsSubmitting(false);
+      toast.error("Жишээ тест ажиллуулахад алдаа гарлаа.");
+      setJudgeResult(null);
+    }
+  };
+
+  const handleSubmitCode = async (overrideLang?: string, overrideSource?: string) => {
+    setIsSubmitting(true);
+    setConsoleOpen(true);
+    setSelectedTestCaseId(null);
+    setJudgeResult({ status: "RUNNING", time: "...", memory: "...", score: 0, testcases: [] });
+    try {
+      const finalLang = overrideLang || language;
+      const finalSource = overrideSource || sourceCode;
+      const submission = await problemApi.submit(code, finalLang, finalSource);
       setSubmissionId(submission.submission_id);
     } catch {
       setIsSubmitting(false);
@@ -826,7 +815,7 @@ export default function ProblemDetailPage() {
 
           <Button
             size="sm"
-            onClick={handleSubmitCode}
+            onClick={() => handleSubmitCode()}
             disabled={isSubmitting}
             className="h-8 text-xs gradient-brand text-white border-0 hover:opacity-90 shadow-md shadow-brand-cyan/20 gap-1.5 font-bold"
           >
@@ -1229,74 +1218,16 @@ int main() {
 
         {/* Right Side: Monaco Code Editor */}
         <div className="w-1/2 flex flex-col bg-[#1e1e1e] overflow-hidden relative">
-          {/* Editor Sub-Header */}
-          <div className="h-10 bg-[#252526] border-b border-white/5 px-4 flex items-center justify-between shrink-0">
-            <div className="flex items-center gap-3">
-              <span className="text-xs text-slate-400">Хэл:</span>
-              <select
-                value={language}
-                onChange={(e) => handleLanguageChange(e.target.value)}
-                className="bg-[#333333] text-xs text-white px-2.5 py-1 rounded-lg border border-white/10 outline-none cursor-pointer"
-              >
-                <option value="g++20">C++20 (GCC 14.2)</option>
-                <option value="g++23">C++23 (GCC 14.2)</option>
-                <option value="g++17">C++17 (GCC 14.2)</option>
-                <option value="python3">Python 3 (3.12)</option>
-                <option value="pypy3">PyPy 3</option>
-                <option value="java">Java 21/25</option>
-                <option value="go">Go</option>
-                <option value="cargo">Rust</option>
-                <option value="node">JavaScript (Node.js)</option>
-                <option value="pascal">Pascal (FPC)</option>
-                <option value="mono-csc">C# (Mono)</option>
-              </select>
-
-              {/* Attach File Button */}
-              <input
-                type="file"
-                ref={fileInputRef}
-                onChange={handleFileAttach}
-                className="hidden"
-                accept=".cpp,.cc,.cxx,.py,.java,.go,.rs,.js,.pas,.cs"
-              />
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => fileInputRef.current?.click()}
-                className="h-7 text-xs text-slate-400 hover:text-brand-cyan gap-1.5"
-              >
-                <Upload className="w-3.5 h-3.5" /> Файл хавсаргах (Attach)
-              </Button>
-            </div>
-
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setSourceCode(DEFAULT_CODE[language] || "")}
-              className="h-7 text-xs text-slate-400 hover:text-white gap-1"
-            >
-              <RefreshCw className="w-3 h-3" /> Reset Code
-            </Button>
-          </div>
-
-          {/* Monaco Editor */}
-          <div className="flex-1 relative">
-            <Editor
-              height="100%"
-              language={getMonacoLanguage(language)}
-              theme={resolvedTheme === "dark" ? "vs-dark" : "light"}
-              value={sourceCode}
-              onChange={(value) => setSourceCode(value || "")}
-              options={{
-                fontSize: 14,
-                minimap: { enabled: false },
-                scrollBeyondLastLine: false,
-                automaticLayout: true,
-                padding: { top: 12, bottom: 12 },
-                fontFamily: "JetBrains Mono, monospace",
-              }}
-            />
-          </div>
+          <VisualIde
+            code={code}
+            sourceCode={sourceCode}
+            setSourceCode={setSourceCode}
+            language={language}
+            setLanguage={setLanguage}
+            resolvedTheme={resolvedTheme || "dark"}
+            isSubmitting={isSubmitting}
+            onSubmit={(finalLang, finalSource) => handleSubmitCode(finalLang, finalSource)}
+          />
 
           {/* Bottom Execution Console Drawer (Dynamically Resizes when Diff is Open) */}
           {consoleOpen && (
