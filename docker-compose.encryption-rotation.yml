@@ -1,0 +1,21 @@
+# Temporary override used only while re-encrypting values with a new key.
+# Remove this file from the Compose command after every encrypted value has
+# been read and saved with the current encryption_key.
+services:
+  api:
+    environment:
+      ENCRYPTION_KEY_PREVIOUS_FILE: /run/secrets/encryption_key_previous
+    secrets: &previous_encryption_key
+      - encryption_key_previous
+  migrate:
+    environment:
+      ENCRYPTION_KEY_PREVIOUS_FILE: /run/secrets/encryption_key_previous
+    secrets: *previous_encryption_key
+  celery:
+    environment:
+      ENCRYPTION_KEY_PREVIOUS_FILE: /run/secrets/encryption_key_previous
+    secrets: *previous_encryption_key
+
+secrets:
+  encryption_key_previous:
+    file: ${OJ_SECRET_DIR:-./secrets}/encryption_key_previous

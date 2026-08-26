@@ -1,0 +1,7 @@
+# Removes fixed production container names so the rotation drill cannot collide
+# with another Compose project on the same Docker host.
+services:
+  db:
+    container_name: !reset null
+  minio:
+    container_name: !reset null

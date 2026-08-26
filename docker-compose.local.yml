@@ -1,0 +1,12 @@
+# Local development/staging access without exposing NPM or data services.
+services:
+  web:
+    build:
+      args:
+        NEXT_PUBLIC_API_ORIGIN: http://localhost:8000
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  api:
+    ports:
+      - "127.0.0.1:8000:8000"

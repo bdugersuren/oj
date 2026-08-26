@@ -1,2 +1,8 @@
 .env
 secrets/
+
+# Runtime state, credentials, private keys, certificates, and access logs must
+# never be committed. Existing tracked files require a separate index/history
+# cleanup and credential rotation; ignore rules do not rewrite Git history.
+config/npm/data/
+config/npm/letsencrypt/

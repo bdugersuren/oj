@@ -1,1 +1,1 @@
-FROM ollama/ollama:0.32.15
+FROM ollama/ollama:0.32.15@sha256:57d60e686821ea81a7748a3ec8141308c8b8f95b27105713954abf7a6529e700

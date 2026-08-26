@@ -4,12 +4,17 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_ORIGIN: ${NEXT_PUBLIC_API_ORIGIN:-}
     container_name: oj-nextjs
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
     pids_limit: 256
     mem_limit: 1g
 
@@ -31,6 +36,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
     pids_limit: 256
     mem_limit: 1g
     env_file:
@@ -63,6 +71,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
     pids_limit: 128
     mem_limit: 512m
     command: python scripts/bootstrap_database.py
@@ -86,7 +97,9 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-oj_db}
       POSTGRES_USER: ${POSTGRES_USER:-oj_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      # Empty direct value makes the base stack fail closed in PostgreSQL;
+      # docker-compose.secrets.yml removes it and supplies *_FILE instead.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -130,7 +143,9 @@ services:
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      # Empty direct value makes the base stack fail closed in MinIO;
+      # docker-compose.secrets.yml removes it and supplies *_FILE instead.
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
       interval: 10s
@@ -153,6 +168,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=512m
     pids_limit: 512
     mem_limit: 2g
     command: celery -A app.core.celery_app worker --loglevel=info -Q judge_queue,celery --concurrency=4
@@ -232,18 +250,23 @@ services:
 
   # Nginx Proxy Manager (NPM)
   npm:
+    profiles: ["ops"]
     build:
       context: ./config/npm-build
       dockerfile: Dockerfile
     container_name: oj-npm
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
     ports:
       - '80:80'
       - '127.0.0.1:81:81'
       - '443:443'
     volumes:
-      - ./config/npm/data:/data
-      - ./config/npm/letsencrypt:/etc/letsencrypt
+      - npmdata:/data
+      - npmletsencrypt:/etc/letsencrypt
     depends_on:
       - web
       - api
@@ -279,9 +302,21 @@ services:
       dockerfile: Dockerfile
     container_name: oj-open-webui
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 2g
     environment:
-      - OLLAMA_BASE_URL=http://ollama:11434
-      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-}
+      OLLAMA_BASE_URL: http://ollama:11434
+      WEBUI_SECRET_KEY_FILE: /app/backend/data/.webui_secret_key
+      CORS_ALLOW_ORIGIN: ${OPEN_WEBUI_CORS_ORIGINS:-http://127.0.0.1:3001}
+      RAG_EMBEDDING_ENGINE: ollama
+      RAG_EMBEDDING_MODEL: ${OPEN_WEBUI_EMBEDDING_MODEL:-nomic-embed-text}
+      UVICORN_WORKERS: "1"
+    ports:
+      - "127.0.0.1:3001:8080"
     volumes:
       - openwebuidata:/app/backend/data
     depends_on:
@@ -310,11 +345,20 @@ services:
       dockerfile: Dockerfile
     container_name: oj-pgadmin
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 512m
     environment:
-      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@know.mn}
-      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-}
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-}
+      PGADMIN_DISABLE_POSTFIX: "true"
+      PGADMIN_LISTEN_PORT: "8080"
     ports:
-      - "127.0.0.1:5050:80"
+      - "127.0.0.1:5050:8080"
+    volumes:
+      - pgadmindata:/var/lib/pgadmin
     depends_on:
       - db
     networks:
@@ -335,3 +379,6 @@ volumes:
   ollamadata:
   openwebuidata:
   qdrantdata:
+  pgadmindata:
+  npmdata:
+  npmletsencrypt:

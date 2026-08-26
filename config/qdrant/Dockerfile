@@ -1,1 +1,1 @@
-FROM qdrant/qdrant:v1.19-unprivileged
+FROM qdrant/qdrant:v1.19-unprivileged@sha256:a0e04fe623cb064502cd869cefc1dc7ce359d8edd481063b5bd351c0a0a2c91e

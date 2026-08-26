@@ -8,11 +8,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SECRET_FILE_SETTINGS = (
     "SECRET_KEY",
+    "ENCRYPTION_KEY",
+    "ENCRYPTION_KEY_PREVIOUS",
     "DATABASE_URL",
     "REDIS_URL",
     "MINIO_ROOT_USER",
     "MINIO_ROOT_PASSWORD",
-    "DMOJ_JUDGE_KEY",
     "SMTP_PASSWORD",
 )
 
@@ -49,6 +50,10 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     
     SECRET_KEY: str = "supersecretkey-generate-a-strong-one-for-production-12345"
+    # Keep data-at-rest encryption independent from JWT signing. Development
+    # falls back to SECRET_KEY; production must provide an explicit key.
+    ENCRYPTION_KEY: Optional[str] = None
+    ENCRYPTION_KEY_PREVIOUS: Optional[str] = None
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15          # 15 минут (short-lived)
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7             # 7 хоног (long-lived, DB-д хадгалагдана)
     
@@ -91,7 +96,6 @@ class Settings(BaseSettings):
     DMOJ_BRIDGE_HOST: str = "bridge"
     DMOJ_BRIDGE_HOSTS: str = "bridge1,bridge2"
     DMOJ_BRIDGE_PORT: int = 9999
-    DMOJ_JUDGE_KEY: str = "dmoj_judge_auth_secret_key_2026"
     JUDGE_LEASE_SECONDS: int = 300
 
     @model_validator(mode="after")
@@ -103,25 +107,29 @@ class Settings(BaseSettings):
             "supersecretkey-generate-a-strong-one-for-production-12345",
             "oj_secure_password_2026",
             "minioadmin_secure_2026",
-            "dmoj_judge_auth_secret_key_2026",
         }
         secret_values = {
             "SECRET_KEY": self.SECRET_KEY,
+            "ENCRYPTION_KEY": self.ENCRYPTION_KEY,
             "DATABASE_URL": self.DATABASE_URL,
             "MINIO_ROOT_PASSWORD": self.MINIO_ROOT_PASSWORD,
-            "DMOJ_JUDGE_KEY": self.DMOJ_JUDGE_KEY,
         }
+        if self.ENCRYPTION_KEY_PREVIOUS:
+            secret_values["ENCRYPTION_KEY_PREVIOUS"] = self.ENCRYPTION_KEY_PREVIOUS
         invalid = [
             name
             for name, value in secret_values.items()
             if not value
             or any(default in value for default in insecure_values)
             or "change-me" in value.lower()
+            or (name in {"SECRET_KEY", "ENCRYPTION_KEY", "ENCRYPTION_KEY_PREVIOUS"} and len(value) < 32)
         ]
         if invalid:
             raise ValueError(
                 "Production secrets must be explicitly replaced: " + ", ".join(invalid)
             )
+        if self.ENCRYPTION_KEY_PREVIOUS == self.ENCRYPTION_KEY:
+            raise ValueError("ENCRYPTION_KEY_PREVIOUS must differ from ENCRYPTION_KEY.")
         if not self.COOKIE_SECURE:
             raise ValueError("COOKIE_SECURE must be true in production.")
         if self.SMTP_ENABLED and not all(

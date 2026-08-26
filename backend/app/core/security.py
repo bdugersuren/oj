@@ -1,5 +1,5 @@
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Union
 
 import bcrypt
@@ -38,7 +38,7 @@ def create_access_token(
     15 минутын нэвтрэх JWT токен үүсгэх.
     Payload: sub (user_id), role, exp
     """
-    expire = datetime.utcnow() + (
+    expire = datetime.now(timezone.utc) + (
         expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     )
     to_encode = {
@@ -69,4 +69,7 @@ def generate_refresh_token() -> str:
 
 def refresh_token_expires_at() -> datetime:
     """Refresh token 7 хоногийн дараа дуусна."""
-    return datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    # Database columns are currently timezone-naive UTC DateTime values.
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+        days=REFRESH_TOKEN_EXPIRE_DAYS
+    )

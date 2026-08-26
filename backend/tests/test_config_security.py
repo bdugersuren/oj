@@ -8,9 +8,9 @@ def production_settings(**overrides):
     values = {
         "ENVIRONMENT": "production",
         "SECRET_KEY": "production-secret-with-at-least-32-random-characters",
+        "ENCRYPTION_KEY": "independent-encryption-key-with-at-least-32-characters",
         "DATABASE_URL": "postgresql+asyncpg://oj_user:nondefault-db-secret@db:5432/oj_db",
         "MINIO_ROOT_PASSWORD": "nondefault-minio-secret",
-        "DMOJ_JUDGE_KEY": "nondefault-dmoj-secret",
         "COOKIE_SECURE": True,
         "CORS_ORIGINS": "https://oj.example.edu",
     }
@@ -22,9 +22,9 @@ def production_settings(**overrides):
     ("field", "value"),
     [
         ("SECRET_KEY", "change-me-in-production"),
+        ("ENCRYPTION_KEY", "change-me-in-production"),
         ("DATABASE_URL", "postgresql+asyncpg://oj_user:oj_secure_password_2026@db/oj_db"),
         ("MINIO_ROOT_PASSWORD", "minioadmin_secure_2026"),
-        ("DMOJ_JUDGE_KEY", "dmoj_judge_auth_secret_key_2026"),
     ],
 )
 def test_production_rejects_default_secrets(field, value):
@@ -35,6 +35,28 @@ def test_production_rejects_default_secrets(field, value):
 def test_production_requires_secure_cookie():
     with pytest.raises(ValidationError):
         production_settings(COOKIE_SECURE=False)
+
+
+def test_production_requires_independent_encryption_key():
+    with pytest.raises(ValidationError):
+        production_settings(ENCRYPTION_KEY=None)
+
+
+@pytest.mark.parametrize("field", ["SECRET_KEY", "ENCRYPTION_KEY"])
+def test_production_rejects_short_cryptographic_keys(field):
+    with pytest.raises(ValidationError):
+        production_settings(**{field: "too-short"})
+
+
+def test_production_previous_encryption_key_must_be_distinct_and_strong():
+    with pytest.raises(ValidationError):
+        production_settings(ENCRYPTION_KEY_PREVIOUS="too-short")
+    with pytest.raises(ValidationError):
+        production_settings(
+            ENCRYPTION_KEY_PREVIOUS=(
+                "independent-encryption-key-with-at-least-32-characters"
+            )
+        )
 
 
 def test_production_requires_safe_judge_lease_duration():

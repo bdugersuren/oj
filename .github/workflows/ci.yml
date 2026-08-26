@@ -68,6 +68,14 @@ jobs:
       MINIO_ROOT_PASSWORD: ci-minio-password
     steps:
       - uses: actions/checkout@v4
+      - name: Enforce immutable base images
+        run: |
+          unpinned="$(rg '^FROM ' --glob 'Dockerfile*' | rg -v '@sha256:' || true)"
+          if [ -n "$unpinned" ]; then
+            echo "Unpinned Docker base image(s):"
+            echo "$unpinned"
+            exit 1
+          fi
       - run: docker compose config --quiet
       - run: docker compose --profile judge config --quiet
-      - run: docker compose --profile ai --profile admin-tools config --quiet
+      - run: docker compose --profile ai --profile ops --profile admin-tools config --quiet

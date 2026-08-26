@@ -1,1 +1,1 @@
-FROM jc21/nginx-proxy-manager:2.15.0
+FROM jc21/nginx-proxy-manager:2.15.0@sha256:83b8d6a2d5ddfdd1f9f8ee240499953dec5f7bbf3b4dafc5f4ac394f1edca930
