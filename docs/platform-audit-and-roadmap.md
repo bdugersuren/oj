@@ -6,15 +6,15 @@
 
 ## Хэрэгжилтийн явц
 
-> Сүүлд шинэчилсэн: 2026-08-26  
+> Сүүлд шинэчилсэн: 2026-08-27
 > Төлөв: `Хийгдээгүй` → `Хэсэгчлэн` → `Баталгаажуулж байна` → `Бүрэн дууссан`
 
 | Багц | Төлөв | Хийгдсэн үр дүн | Дуусгахын тулд дараагийн алхам |
 |---|---|---|---|
-| P0.1 Sandbox-only execution | **Баталгаажуулж байна** | Submission endpoint → Redis/Celery → DMOJ → PostgreSQL/PubSub E2E; duplicate delivery, dead bridge retry, Celery container SIGKILL → Redis redelivery → expired DB lease reclaim бүгд AC бөгөөд JudgeResult/XP давхардаагүй; workspace model-solution/generator persistent sandbox job | Workspace Celery+MinIO E2E; actual ASGI auth/WebSocket handshake smoke |
-| P0.2 Verdict ба archive integrity | **Баталгаажуулж байна** | Төвлөрсөн bounded ZIP validator/extractor; traversal, symlink, size/count/depth/compression ratio хамгаалалт; `OLE` ба `SYSTEM_ERROR`; DMOJ `AC/WA/CE/RTE/TLE/MLE/OLE` matrix амжилттай; non-zero exit-ийн `IR → RTE` mapping засагдсан; fresh/existing migration smoke амжилттай | Upload/import endpoint бүрийн malicious archive negative integration test; custom checker/subtask/interactive/signature matrix |
-| P0.3 Secret/network/dependency | **Хэсэгчлэн** | Production secret/HTTPS CORS/cookie startup validation; internal data-service ports хаалттай; admin port localhost; profiles/internal judge network; capability/PID/RAM limit; үндсэн image digest pin; API/Celery/migration default UID 1000 non-root; bridge runtime smoke | Бодит secret rotate хийх; Compose secrets/file support; үлдсэн service image digest lock; read-only root/AppArmor/seccomp policy батлах |
-| P0.4 CI/test baseline | **Хэсэгчлэн** | GitHub Actions backend/frontend/Compose gate; reproducible non-root backend image; 52/52 backend test pass; live/ready/WebSocket snapshot tests; `tsc --noEmit`; migration/Compose validation; DMOJ verdict/generator/submission/hard-kill smoke | Frontend 123 error/216 warning lint өр; webpack/Turbopack build; workspace queue E2E; үлдсэн warning арилгах |
+| P0.1 Sandbox-only execution | **Бүрэн дууссан** | Submission endpoint → Redis/Celery → DMOJ → PostgreSQL/PubSub E2E; duplicate delivery, dead bridge retry, Celery container SIGKILL → Redis redelivery → expired DB lease reclaim бүгд AC бөгөөд JudgeResult/XP давхардаагүй; workspace API dispatch → MinIO → Celery → DMOJ → MinIO E2E AC; actual ASGI cookie/CSRF/RBAC/WebSocket snapshot AC | P1 load/chaos regression-д тасралтгүй хадгалах |
+| P0.2 Verdict ба archive integrity | **Бүрэн дууссан** | Төвлөрсөн bounded ZIP validator/extractor; traversal, symlink, duplicate, size/count/depth/compression ratio хамгаалалт; actual ASGI multipart дээр дөрвөн ZIP boundary 400/no-side-effect; bounded Flowgorithm XML/Scratch JSON fail-fast; `AC/WA/CE/RTE/TLE/MLE/OLE/SYSTEM_ERROR`; native custom checker, subtask/batch scoring, interactive, signature болон bundled sample matrix амжилттай | P1 regression corpus-д тасралтгүй хадгалах |
+| P0.3 Secret/network/dependency | **Хэсэгчлэн** | Production secret/HTTPS CORS/cookie startup validation; Compose mounted secret-file override ба fail-fast backend loader; PostgreSQL/MinIO file-only credential startup smoke; internal data-service ports хаалттай; admin port localhost; profiles/internal judge network; capability/PID/RAM limit; үндсэн image digest pin; API/Celery/migration default UID 1000 non-root; bridge runtime smoke | Бодит credential rotation drill; NPM/pgAdmin/Open WebUI credential policy; үлдсэн service image digest lock; read-only root/AppArmor/seccomp policy батлах |
+| P0.4 CI/test baseline | **Хэсэгчлэн** | GitHub Actions backend/frontend/Compose gate; reproducible non-root backend image; 87/87 backend test pass; live/ready/WebSocket snapshot tests; `tsc --noEmit`; migration/Compose validation; DMOJ verdict/advanced-grader/generator/submission/workspace/hard-kill, actual ASGI auth/WebSocket/upload security smoke | Frontend 123 error/216 warning lint өр; webpack/Turbopack build; үлдсэн warning арилгах |
 | P1 Найдвартай ажиллагаа | **Хийгдээгүй** | — | P0 exit criteria бүрэн хангах |
 | P2 Visual IR/Flowgorithm | **Хийгдээгүй** | — | P1 дууссаны дараа IR schema батлах |
 | P3 Scratch/AI/remote judge | **Хийгдээгүй** | — | P2 pilot үр дүнгээр эхлүүлэх |
@@ -31,25 +31,27 @@
   - [x] Workspace testlib generator-ийг output-producing persistent DMOJ sandbox job болгосон
   - [x] Submission endpoint → Redis/Celery → DMOJ → DB/PubSub E2E, duplicate delivery ба dead-bridge retry
   - [x] Celery container SIGKILL, Redis redelivery, expired `RUNNING` DB lease reclaim, atomic final+XP
-  - [ ] Workspace Celery+MinIO E2E, actual ASGI auth/WebSocket handshake
+  - [x] Workspace API dispatch → MinIO → Celery → DMOJ → MinIO full-stack E2E
+  - [x] Actual ASGI cookie/CSRF/RBAC/refresh rotation/WebSocket handshake
 - P0.2 Verdict/archive integrity
   - [x] `OLE`, `SYSTEM_ERROR`, DMOJ `IR → RTE` mapping болон fail-closed error урсгал
   - [x] Empty/invalid testcase AC өгөхгүй болсон
   - [x] Central bounded ZIP validator/extractor болон unit negative corpus
   - [x] Fresh DB bootstrap, previous head → current head migration smoke
-  - [ ] Upload/import API бүрийн archive/XML/JSON adversarial integration test
-  - [ ] Custom checker, subtask, interactive, signature grader regression corpus
+  - [x] Upload/import API бүрийн archive/XML/JSON adversarial integration test
+  - [x] Custom checker, subtask, interactive, signature grader regression corpus
 - P0.3 Secret/network/dependency
   - [x] Production insecure default/HTTP CORS/insecure cookie startup validation
   - [x] Data-service public port closure, localhost admin binding, Compose profiles
   - [x] Egress-гүй judge network, runtime capability/PID/RAM smoke
   - [x] API, Celery, migration UID/GID 1000 non-root runtime smoke
   - [x] Python/Node/PostgreSQL/Redis/DMOJ үндсэн image digest pin
-  - [ ] Compose secret file ingestion, production credential rotation drill
+  - [x] Compose secret file ingestion ба PostgreSQL/MinIO/backend runtime smoke
+  - [ ] Production credential rotation drill ба admin-tool credential policy
   - [ ] Үлдсэн image digest, read-only root, AppArmor/seccomp policy
 - P0.4 CI/test baseline
   - [x] Backend/frontend/Compose GitHub Actions baseline
-  - [x] Backend 52/52 test, fresh/downgrade/upgrade migration, live/ready/WebSocket snapshot tests
+  - [x] Backend 87/87 test, fresh/downgrade/upgrade migration, live/ready/WebSocket snapshot tests
   - [x] Python compile, TypeScript typecheck, Compose profile, diff validation
   - [x] DMOJ socket verdict smoke matrix
   - [ ] Frontend ESLint zero-error ба production build
@@ -62,9 +64,10 @@
 - Workspace model solution болон generator endpoint API контейнерт binary ажиллуулахгүй; `202 + job_id` persistent Celery/DMOJ урсгал ашиглана.
 - Worker judge идэвхгүй/холболтгүй үед mock AC/RTE зохиохгүй. Түр алдаанд retry хийж, эцсийн оролдлого дуусвал `SYSTEM_ERROR` хадгална.
 - ZIP validator нь archive upload/read/extract өмнө canonical path, symlink, duplicate, corruption, expanded size ба compression ratio шалгана.
-- Production config insecure default secret, `COOKIE_SECURE=false`, localhost CORS-той бол startup fail хийнэ. Бодит production `.env`-ийн secret-ийг солихгүйгээр шинэ API асахгүй.
+- Production config insecure default secret, `COOKIE_SECURE=false`, localhost CORS-той бол startup fail хийнэ. Бодит production secret file-үүдийг үүсгэхгүйгээр шинэ API асахгүй.
 - MinIO bucket initialization module import үеэс FastAPI startup lifecycle руу шилжсэн. Иймээс unit test/CLI import external network-оос хамаарахгүй, production startup MinIO-г заавал шалгана.
 - Repository-ийн хуучин Alembic chain хоосон schema үүсгэж чаддаггүйг smoke test илрүүлсэн. `migrate` job нь хоосон DB-д current metadata schema үүсгэн head stamp хийх, version-тэй DB-д `upgrade head` хийх, харин non-empty unversioned DB-г fail-closed болгох болсон.
+- Fresh DB runtime smoke нь world startup seed `student_levels.id=1` гэж хатуу таамагласнаас FK алдаатай байсныг илрүүлсэн. Startup одоо Bronze түвшинг нэрээр idempotent үүсгэж/олж, бодит ID-г world FK-д ашиглана.
 - Judge bridge нь public/outbound сүлжээнээс салсан `judge-network` дээр ажиллана. API/worker process-уудад `no-new-privileges`, capability drop, PID/RAM limit нэмсэн.
 - Workspace model solution шалгалт `workspace_judge_jobs` хүснэгтэд хадгалагдаж, `QUEUED → RUNNING → FINAL/SYSTEM_ERROR` төлөвтэй Celery/DMOJ job болсон. API process зөвхөн job үүсгэнэ; bounded source/testcase-г worker MinIO-оос уншиж, frontend poll хийнэ. Owner/admin access шалгалттай.
 - Workspace testlib generator мөн `202 + job_id` persistent урсгалтай. Нэг job 1–20 bounded parameter мөр хүлээн авч, мөр бүрийн synthetic `argc/argv`-г actual generator `main` lifecycle дотор `registerGen`-д өгнө. Generator stdout болон model-solution stdout-ийг DMOJ-ийн output limit-тэй capture mode-оор авч, бүх case амжилттай болсны дараа л draft `.in/.out/init.yml` хадгална. Full smoke дээр `1 10`, `50 60` input-оос `11`, `110` output зөв үүссэн.
@@ -75,25 +78,35 @@
 - Ephemeral full pipeline smoke дээр pending/final duplicate delivery ignore, хоёр testcase-ийн нэг удаагийн JudgeResult, нэг удаагийн XP, Redis final event, dead bridge → 3 секунд retry → healthy bridge AC бүгд батлагдсан.
 - Submission болон workspace job `judge_attempt` + expiring DB lease-тэй болсон. Redis visibility timeout env-configurable (default 600 секунд). Hard-kill smoke дээр attempt 1 RUNNING worker-ийг SIGKILL хийж, unacked task шинэ worker-д redeliver болоход expired lease reclaim хийн attempt 2 AC, хоёр JudgeResult, XP=20 болсон.
 - Final verdict/JudgeResult болон үндсэн XP/reward marker нэг transaction boundary-д commit хийгдэнэ. Иймээс worker final commit-ийн өмнө үхвэл бүх өөрчлөлт rollback/reclaim; commit-ийн дараа үхвэл terminal status дахин reward олгохгүй.
+- Level/achievement зэрэг post-reward hook алдаа нь commit болсон terminal submission-ийг `PENDING` болгохгүй; hook бүр rollback/log хийгээд дараагийн optional hook-ийг үргэлжлүүлнэ.
+- Fresh isolated Compose stack дээр workspace verify job `AC`, generator-ийн хоёр мөр болон model-solution `AC`; MinIO-д `1 10 → 11`, `50 60 → 110`, шинэ `init.yml` round-trip батлагдсан. Smoke script түр object/DB мөрөө цэвэрлэнэ.
 - WebSocket Redis subscribe хийсний дараа DB snapshot явуулдаг болсон. Ингэснээр client холбогдохоос өмнө final event publish болсон ч terminal төлөв алдагдахгүй.
+- Public registration нь `teacher/admin` role авахыг 403 болгож privilege escalation-ийг хаасан; student progress бодит Bronze level ID ашиглана. Actual ASGI smoke cookie auth, CSRF, refresh rotation/replay reject, student/teacher RBAC болон terminal WebSocket snapshot-ийг баталсан.
+- Fresh SMTP config өмнө нь credential байхгүй ч enabled гэж тооцогдон, mail илгээгээгүй мөртлөө хэрэглэгчийг unverified түгждэг байсан. SMTP одоо explicit opt-in; production enabled үед host/user/password/from-address бүрэн биш бол startup validation fail хийнэ.
+- Upload body-г parser руу өгөхөөс өмнө 64MB+1 bounded read хийж 413 буцаана. ZIP ашигладаг testcase, problem package, problem import, workspace route бүр traversal/symlink/duplicate/compression-bomb corpus-той; actual ASGI multipart traversal smoke бүгд 400 бөгөөд DB side effect үүсгээгүй.
+- Problem import `problem.json` object/type/code/string/count/depth/node limit-ээ DB write-ээс өмнө шалгаж, validation алдаанд rollback+400 хийнэ. Эхний premature commit устсан.
+- Flowgorithm source 512KB/node/depth/attribute limit-тэй, DTD/entity хоригтой. Scratch prototype raw Python fallback-гүй болж, bounded JSON object болон non-empty bounded `python_code` шаарддаг; visual submission malformed бол DB/job үүсэхээс өмнө 400.
+- Native DMOJ advanced-grader smoke нь custom checker `AC/WA`, interactive `AC/WA`, function-signature `AC/WA`-г баталсан. Batch packet metadata-г bridge хадгалдаг болж, subtask оноог child case бүрээр давхар нэмэх бус бүх child AC үед outer batch points-оор тооцно; regression үр дүн full `100`, нэг 60-point batch унахад `40` болсон. DMOJ-ийн short-circuit `SC` төлөвийг AC мэт харагдуулахгүйгээр fail-closed `WA` болгов.
+- Repository-ийн custom checker, interactive, function-signature sample ZIP-үүдийг DMOJ v5 native `init.yml` schema болон private helper asset-тай болгосон. Interactive helper-ийн memory limit нь DMOJ-ийн KB нэгжээр `65536`; bundled гурван package бодит compile/run дээр бүгд `AC` болсон.
+- `docker-compose.secrets.yml` production override нь API/migrate/Celery-ийн `.env` inheritance-ийг reset хийж, JWT, database URL, MinIO болон DMOJ key-г `/run/secrets/*` read-only file-аар өгнө. PostgreSQL/MinIO direct password environment-ийг Compose merge-ээс устгаж, албан `_FILE` contract ашиглана; `.env` болон `secrets/` version control-оос хасагдсан.
+- Backend startup нь `SECRET_KEY`, `DATABASE_URL`, `REDIS_URL`, MinIO credential, DMOJ key, SMTP password-ийн `*_FILE` хувилбарыг bounded UTF-8 text байдлаар уншина. File байхгүй/хоосон эсвэл process environment-д direct утга давхар өгөгдвөл fail-fast. Rendered production Compose-д direct secret value байхгүй, PostgreSQL болон MinIO file-only startup smoke pass болсон; бодит өгөгдөлтэй credential rotation drill дараагийн ажил хэвээр.
 - API/Celery/migration image default `uid=1000(oj), gid=1000`; DMOJ `judge` UID/GID-тэй таарсан `/problems` permission-тай. Non-root pipeline runtime smoke pass.
-- Docker backend test image дотор 52 test амжилттай; Pydantic v2, AsyncMock fixture, Qdrant compatibility warning үлдсэн. Frontend TypeScript шалгалт амжилттай, lint 123 error/216 warning; local Turbopack build нь орчны process/port restriction дээр panic болсон тул application build-ийн pass/fail хараахан батлагдаагүй.
+- Docker backend test image дотор 87 test амжилттай; Pydantic v2, AsyncMock fixture, Qdrant compatibility warning үлдсэн. Frontend TypeScript шалгалт амжилттай, lint 123 error/216 warning; local Turbopack build нь орчны process/port restriction дээр panic болсон тул application build-ийн pass/fail хараахан батлагдаагүй.
 
 ### Яг дараагийн алхам
 
-1. Workspace model-solution/generator-ийг бодит MinIO + Celery + DMOJ stack-аар E2E; actual ASGI auth/WebSocket handshake smoke нэмэх.
-2. Upload/import endpoint бүрт malicious ZIP/XML/JSON negative integration test нэмж P0.2 archive хэсгийг хаах; дараа нь custom checker/subtask/interactive/signature matrix ажиллуулах.
-3. Secret rotation + Compose secret file ingestion нэвтрүүлж, NPM/MinIO/pgAdmin/Open WebUI credential fallback-ийг бүрэн хориглох.
-4. Frontend lint error-ийг багцаар цэвэрлээд webpack/Turbopack production build, component/E2E gate ажиллуулах.
-5. Generator-ийн per-parameter compile болон 50 concurrent submission load budget хэмжих; queue wait/lease/visibility timeout-ийг хэмжилтээр тохируулах.
+1. PostgreSQL/MinIO/API нууцыг backup-тай staging өгөгдөл дээр дарааллаар rotate хийж, хуучин credential хүчингүй болсон болон rollback/recovery-г батлах; NPM/pgAdmin/Open WebUI credential fallback-ийг бүрэн хориглох.
+2. Үлдсэн service image-ийг digest-аар pin хийж, read-only root filesystem болон AppArmor/seccomp policy-г runtime smoke-оор батлах.
+3. Frontend lint error-ийг багцаар цэвэрлээд webpack/Turbopack production build, component/E2E gate ажиллуулах.
+4. Generator-ийн per-parameter compile болон 50 concurrent submission load budget хэмжих; queue wait/lease/visibility timeout-ийг хэмжилтээр тохируулах.
 
 ## 1. Удирдлагын хураангуй
 
 Платформын бүтээгдэхүүний суурь зөв сонгогдсон. Next.js/FastAPI хослол, PostgreSQL, Redis/Celery, MinIO, DMOJ tier-3, хичээл–бодлого–анги–тэмцээн–ахицын өгөгдлийн загвар нь нэг сургуулийн хэмжээний интерактив сургалтын системийг хөгжүүлэхэд хангалттай. Багшийн problem workspace, custom checker, subtask, MinIO package, WebSocket үр дүн, RBAC, CSRF, refresh token, gamification, AI-ийн feature flag зэрэг бодитой ажил эхэлсэн байна.
 
-Аудит эхлэх үед системийг интернетэд production хэлбэрээр нээх боломжгүй байсан гол шалтгаан нь sample run болон judge унтарсан горимд сурагчийн код API/Celery контейнерийн дотор энгийн `subprocess`-оор ажилладаг явдал байв. Энэ замыг одоогийн working tree-д хааж, submission/sample/model-solution/generator-ийг DMOJ queue boundary руу шилжүүлсэн. Submission queue, dead-bridge retry, hard-kill reclaim батлагдсан ч workspace full-stack E2E, secret rotation/Compose secrets, archive endpoint integration, frontend quality gate бүрэн дуусаагүй тул **P0 production hold одоогоор хэвээр**.
+Аудит эхлэх үед системийг интернетэд production хэлбэрээр нээх боломжгүй байсан гол шалтгаан нь sample run болон judge унтарсан горимд сурагчийн код API/Celery контейнерийн дотор энгийн `subprocess`-оор ажилладаг явдал байв. Энэ замыг одоогийн working tree-д хааж, submission/sample/model-solution/generator-ийг DMOJ queue boundary руу шилжүүлсэн. Submission queue, dead-bridge retry, hard-kill reclaim, workspace full-stack E2E, archive endpoint integration болон advanced grader correctness батлагдсан ч secret rotation/Compose secrets, үлдсэн container hardening, frontend quality gate бүрэн дуусаагүй тул **P0 production hold одоогоор хэвээр**.
 
-Одоо үлдсэн том эрсдэлүүд нь production credential rotation/secret file, workspace full-stack E2E, бүх image-ийн immutable pin, backup/restore, observability болон frontend quality debt юм. Host exposure, mock AC, infrastructure→RTE, worker hard-kill recovery зэрэг анхны P0 олдворын хэд хэдэн хэсэг working tree-д засагдсан. Frontend lint baseline 123 error/216 warning; backend reproducible image suite 52 pass болсон.
+Одоо үлдсэн том эрсдэлүүд нь production credential rotation, бүх image-ийн immutable pin, үлдсэн container policy, backup/restore, observability болон frontend quality debt юм. Host exposure, mock AC, infrastructure→RTE, worker hard-kill recovery, workspace full-stack pipeline, advanced grader, actual auth/WebSocket болон malicious upload boundary зэрэг анхны P0 олдворын хэд хэдэн хэсэг working tree-д засагдсан. Frontend lint baseline 123 error/216 warning; backend reproducible image suite 87 pass болсон.
 
 ### Шийдвэр
 
@@ -116,7 +129,7 @@
 Хязгаарлалт:
 
 - Анхны аудитад Docker runtime шалгагдаагүй байсан; хэрэгжилтийн шатанд pinned DMOJ image build, `no-new-privileges + SYS_PTRACE`, egress-гүй internal network, dynamic problem grading болон verdict matrix-ийг isolated ephemeral контейнерээр баталсан. App-ийн бүх сервисийг production compose байдлаар зэрэг асаасан load/E2E test хараахан хийгдээгүй.
-- Анхны аудитад host `pytest` байгаагүй; одоо reproducible backend image дотор 52 test pass болсон. PostgreSQL fresh bootstrap, downgrade болон өмнөх Alembic head-ээс upgrade smoke pass болсон.
+- Анхны аудитад host `pytest` байгаагүй; одоо reproducible backend image дотор 87 test pass болсон. PostgreSQL fresh bootstrap, downgrade болон өмнөх Alembic head-ээс upgrade smoke pass болсон.
 - Production traffic, хэрэглэгчийн analytics, серверийн бодит CPU/RAM/GPU хэмжилт өгөөгүй тул capacity тоонууд нь эхний load-test target юм.
 - Working tree-ийн хэрэглэгчийн өөрчлөлтийг аудитад хамруулсан боловч засварлаагүй.
 
@@ -560,17 +573,17 @@ Exit criteria:
 
 ### Security
 
-- [ ] Бүх user-controlled execution зөвхөн hardened judge-д
+- [x] Бүх user-controlled execution зөвхөн hardened judge-д
 - [ ] Default/committed production secret байхгүй; rotation туршсан
 - [ ] Public port зөвхөн 80/443; admin access restricted
-- [ ] Safe archive/XML/JSON validation ба adversarial tests ногоон
+- [x] Safe archive/XML/JSON validation ба adversarial tests ногоон
 - [ ] RBAC/IDOR/hidden data tests ногоон
 
 ### Correctness
 
-- [ ] Empty/invalid problem AC өгөхгүй
-- [ ] CE/WA/TLE/MLE/OLE/RTE/SYSTEM_ERROR ялгарна
-- [ ] Retry/restart duplicate score/XP үүсгэхгүй
+- [x] Empty/invalid problem AC өгөхгүй
+- [x] CE/WA/TLE/MLE/OLE/RTE/SYSTEM_ERROR ялгарна
+- [x] Retry/restart duplicate score/XP үүсгэхгүй
 - [ ] Supported language/checker/grader бүр reference corpus давсан
 
 ### Operations

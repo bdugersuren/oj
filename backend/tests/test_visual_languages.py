@@ -1,6 +1,6 @@
 import pytest
 from app.services.flowgorithm_transpiler import transpile_fprg_to_python, FlowgorithmTranspileError
-from app.services.scratch_transpiler import transpile_scratch_to_python
+from app.services.scratch_transpiler import ScratchTranspileError, transpile_scratch_to_python
 
 def test_flowgorithm_transpiler_simple():
     xml_content = """<?xml version="1.0"?>
@@ -60,6 +60,26 @@ def test_scratch_transpiler():
     python_code = transpile_scratch_to_python(json_payload)
     assert python_code == "print(10)"
     
-    # Fallback
-    raw_python = "print(10)"
-    assert transpile_scratch_to_python(raw_python) == "print(10)"
+    with pytest.raises(ScratchTranspileError):
+        transpile_scratch_to_python("print(10)")
+
+
+def test_flowgorithm_rejects_dtd_and_excessive_depth():
+    with pytest.raises(FlowgorithmTranspileError, match="DTD"):
+        transpile_fprg_to_python(
+            '<!DOCTYPE program [<!ENTITY x "boom">]><program>&x;</program>'
+        )
+
+    nested = "<program>" + "<if>" * 101 + "</if>" * 101 + "</program>"
+    with pytest.raises(FlowgorithmTranspileError, match="deeply nested"):
+        transpile_fprg_to_python(nested)
+
+
+def test_scratch_rejects_deep_or_wrong_shape_json():
+    value = '"leaf"'
+    for _ in range(45):
+        value = f"[{value}]"
+    with pytest.raises(ScratchTranspileError, match="nesting"):
+        transpile_scratch_to_python(value)
+    with pytest.raises(ScratchTranspileError, match="JSON object"):
+        transpile_scratch_to_python('["python_code"]')

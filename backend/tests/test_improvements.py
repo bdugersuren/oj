@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 
@@ -51,6 +53,21 @@ def test_timezone_conversion_to_ulaanbaatar():
     assert last_local.month == 8
     assert last_local.day == 11
     assert last_local.hour == 7
+
+
+def test_post_reward_hook_failure_does_not_escape_or_skip_next_hook():
+    from app.workers.judge_worker import _run_post_reward_hooks
+
+    db = MagicMock()
+    progress = SimpleNamespace(user_id="student-id")
+    with patch(
+        "app.workers.judge_worker._check_level_up",
+        side_effect=RuntimeError("optional level failure"),
+    ), patch("app.workers.judge_worker._check_achievements") as achievements:
+        _run_post_reward_hooks(db, progress, "student-id")
+
+    db.rollback.assert_called_once()
+    achievements.assert_called_once_with(db, progress)
 
 
 def test_ai_ticket_reply_formatting():

@@ -902,6 +902,11 @@ def _award_xp(db, user_id, problem, submission=None):
     # Final verdict + үндсэн XP аль хэдийн нэг transaction-аар commit болсон.
     # Нэмэлт gamification hook алдаа гаргавал judge task-ийг retry хийж,
     # terminal submission-ийг буцааж PENDING болгох ёсгүй.
+    _run_post_reward_hooks(db, progress, user_id)
+
+
+def _run_post_reward_hooks(db, progress, user_id):
+    """Run optional gamification updates without changing a final judge result."""
     for hook in (_check_level_up, _check_achievements):
         try:
             hook(db, progress)
@@ -909,7 +914,7 @@ def _award_xp(db, user_id, problem, submission=None):
             db.rollback()
             logger.exception(
                 "Post-reward hook %s failed for user %s; judge result remains final.",
-                hook.__name__,
+                getattr(hook, "__name__", hook.__class__.__name__),
                 user_id,
             )
 

@@ -518,7 +518,12 @@ async def upload_testcases_zip(
         raise HTTPException(status_code=400, detail="Зөвхөн ZIP файл оруулах боломжтой.")
 
     problem = await _get_problem_or_404(code, db)
-    content = await file.read()
+    from app.services.upload_validation import UploadValidationError, read_upload_bytes
+
+    try:
+        content = await read_upload_bytes(file, 64 * 1024 * 1024)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
 
     try:
         zf = zipfile.ZipFile(io.BytesIO(content))
@@ -803,7 +808,12 @@ async def upload_problem_package(
     import io
     import zipfile
     
-    contents = await file.read()
+    from app.services.upload_validation import UploadValidationError, read_upload_bytes
+
+    try:
+        contents = await read_upload_bytes(file, 64 * 1024 * 1024)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
     if not zipfile.is_zipfile(io.BytesIO(contents)):
         raise HTTPException(status_code=400, detail="Илгээсэн файл зөв ZIP архив биш байна.")
 
@@ -1108,6 +1118,39 @@ async def export_problem(
     )
 
 
+def _validate_problem_import_metadata(prob_meta) -> None:
+    import re
+
+    from app.services.upload_validation import UploadValidationError, validate_json_tree
+
+    validate_json_tree(prob_meta, max_nodes=20_000, max_depth=30)
+    if not isinstance(prob_meta, dict):
+        raise UploadValidationError("problem.json must contain a JSON object.")
+    code = prob_meta.get("code", "IMPORTED")
+    if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,30}", code.strip()):
+        raise UploadValidationError("Problem code must be 1-30 safe characters.")
+    for key, max_bytes in {
+        "title": 200,
+        "topic": 50,
+        "statement_pdf_path": 255,
+        "source_citation": 255,
+        "statement_markdown": 1024 * 1024,
+    }.items():
+        value = prob_meta.get(key)
+        if value is not None and (
+            not isinstance(value, str) or len(value.encode("utf-8")) > max_bytes
+        ):
+            raise UploadValidationError(f"Invalid or oversized problem.json field: {key}")
+    test_cases = prob_meta.get("test_cases", [])
+    hints = prob_meta.get("hints", [])
+    if not isinstance(test_cases, list) or len(test_cases) > 2_000:
+        raise UploadValidationError("problem.json test_cases must have at most 2000 items.")
+    if not isinstance(hints, list) or len(hints) > 100:
+        raise UploadValidationError("problem.json hints must have at most 100 items.")
+    if any(not isinstance(item, dict) for item in [*test_cases, *hints]):
+        raise UploadValidationError("problem.json testcase and hint entries must be objects.")
+
+
 @router.post("/import", response_model=ProblemListItem, summary="Бодлогыг ZIP файлыг уншиж импортлох (давхардсан код таньж suffix нэмэх)")
 async def import_problem(
     file: UploadFile = File(...),
@@ -1116,8 +1159,12 @@ async def import_problem(
 ):
     import io, zipfile, json
     
-    contents = await file.read()
-    zip_buffer = io.BytesIO(contents)
+    from app.services.upload_validation import UploadValidationError, read_upload_bytes
+
+    try:
+        contents = await read_upload_bytes(file, 64 * 1024 * 1024)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
     
     try:
         from app.services.safe_archive import open_validated_zip
@@ -1127,6 +1174,7 @@ async def import_problem(
                 raise HTTPException(status_code=400, detail="ZIP багцад 'problem.json' файл олдсонгүй.")
                 
             prob_meta = json.loads(z.read("problem.json").decode("utf-8"))
+            _validate_problem_import_metadata(prob_meta)
             
             statement_markdown = ""
             if "statement.md" in z.namelist():
@@ -1159,16 +1207,15 @@ async def import_problem(
                 xp_reward=int(prob_meta.get("xp_reward", 20)),
                 difficulty=DifficultyLevel(prob_meta.get("difficulty", "Bronze")),
                 topic=prob_meta.get("topic", "Brute Force"),
-                olympiad_scope=OlympiadScope(prob_meta.get("olympiad_scope", "Олимпиад биш / Сургалт")),
-                division=DivisionCategory(prob_meta.get("division", "Ерөнхий")),
+                olympiad_scope=OlympiadScope(prob_meta.get("olympiad_scope", OlympiadScope.TRAINING.value)),
+                division=DivisionCategory(prob_meta.get("division", DivisionCategory.GENERAL.value)),
                 olympiad_year=prob_meta.get("olympiad_year"),
                 source_citation=prob_meta.get("source_citation"),
                 created_by_id=current_user.id
             )
             
             db.add(new_problem)
-            await db.commit()
-            await db.refresh(new_problem)
+            await db.flush()
             
             # Upload assets/ to MinIO
             for file_path in z.namelist():
@@ -1193,7 +1240,7 @@ async def import_problem(
                     f"/problems/{unique_code}/assets/"
                 )
                 new_problem.statement_markdown = statement_markdown
-                await db.commit()
+                await db.flush()
                 
             # Import checker.cpp if exists
             if "checker.cpp" in z.namelist():
@@ -1264,9 +1311,14 @@ async def import_problem(
                 "solved_status": "unsolved"
             }
             
-    except (zipfile.BadZipFile, ValueError) as exc:
+    except HTTPException:
+        await db.rollback()
+        raise
+    except (zipfile.BadZipFile, ValueError, TypeError, KeyError) as exc:
+        await db.rollback()
         raise HTTPException(status_code=400, detail=f"Хүчингүй ZIP файл: {exc}")
     except Exception as e:
+        await db.rollback()
         import logging
         logging.getLogger(__name__).error(f"Error importing problem package: {e}")
         raise HTTPException(status_code=500, detail=f"Бодлого импортлоход алдаа гарлаа: {str(e)}")

@@ -4,12 +4,32 @@ from sqlalchemy import select
 
 from app.models.gamification import World, Stage, StageProblem
 from app.models.problem import Problem
+from app.models.progression import StudentLevel
 
 logger = logging.getLogger(__name__)
 
 async def initialize_worlds_and_stages(db: AsyncSession):
     """DB-д суурь суралцах ертөнц (Worlds) болон шатуудыг (Stages) автоматаар үүсгэнэ."""
-    # 1. World 1: Үндсэн алгоритм (required_level_id = 1)
+    # Fresh schema дээр seed_data.py-г тусад нь ажиллуулсан эсэхээс хамаарахгүй.
+    # Integer PK=1 гэж таах нь sequence/import хийсэн DB дээр мөн буруу байж болно.
+    level_res = await db.execute(
+        select(StudentLevel).where(StudentLevel.name == "Bronze")
+    )
+    bronze = level_res.scalar_one_or_none()
+    if not bronze:
+        bronze = StudentLevel(
+            name="Bronze",
+            min_xp=0,
+            required_solved=0,
+            order=1,
+            color="#cd7f32",
+            icon="Star",
+        )
+        db.add(bronze)
+        await db.flush()
+        logger.info("Bronze student level created for fresh database startup.")
+
+    # 1. World 1: Үндсэн алгоритм
     world1_res = await db.execute(select(World).where(World.slug == "world-1-basics"))
     world1 = world1_res.scalar_one_or_none()
     if not world1:
@@ -18,7 +38,7 @@ async def initialize_worlds_and_stages(db: AsyncSession):
             title="Алгоритмын Үндэс",
             description="Програмчлалын суурь ухагдахуун болон хялбар алгоритмууд",
             order=1,
-            required_level_id=1
+            required_level_id=bronze.id
         )
         db.add(world1)
         await db.flush()

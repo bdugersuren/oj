@@ -1,0 +1,5 @@
+checker: checker.py
+time_limit: 1.0
+memory_limit: 64
+test_cases:
+  - {in: cases/case1.in, out: cases/case1.out, points: 100, sample: true}

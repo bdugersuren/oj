@@ -296,7 +296,12 @@ async def upload_workspace_testcases_zip(
     if not file.filename.endswith(".zip"):
         raise HTTPException(status_code=400, detail="Зөвхөн ZIP архив оруулах боломжтой.")
 
-    zip_bytes = await file.read()
+    from app.services.upload_validation import UploadValidationError, read_upload_bytes
+
+    try:
+        zip_bytes = await read_upload_bytes(file, 64 * 1024 * 1024)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=413, detail=str(exc))
 
     def _process_zip():
         try:

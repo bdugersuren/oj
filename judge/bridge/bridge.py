@@ -8,6 +8,7 @@ import socketserver
 import struct
 import sys
 import threading
+import yaml
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,8 @@ STATUS_PRIORITY = (
     # verdict model represents both signal crashes and non-zero exits as RTE.
     (Result.IR, "RTE"),
     (Result.WA, "WA"),
+    # A short-circuited/dependency-skipped case must never look accepted.
+    (Result.SC, "WA"),
 )
 
 
@@ -72,10 +75,11 @@ class CapturePackets:
         self.judge = judge
         self.reset()
 
-    def reset(self) -> None:
+    def reset(self, batch_points: dict[int, float] | None = None) -> None:
         self.results: list[dict[str, Any]] = []
         self.compile_error: str | None = None
         self.internal_error: str | None = None
+        self.batch_points = batch_points or {}
 
     def supported_problems_packet(self, _problems: Any) -> None: pass
     def compile_message_packet(self, _message: str) -> None: pass
@@ -106,6 +110,7 @@ class CapturePackets:
             "time_ms": round(result.execution_time * 1000, 3),
             "memory_kb": result.max_memory,
             "checker_output": result.extended_feedback or result.feedback or result.output,
+            "batch_number": int(getattr(result.case, "batch", 0)) or None,
             # Kept private unless the caller explicitly requests capture mode.
             # DMOJ has already applied its per-case output limit at this point.
             "_program_output": result.output,
@@ -171,6 +176,37 @@ class DMOJAdapter:
         judgeenv.clear_problem_dirs_cache()
         return problem_id, testcase_ids, directory
 
+    @staticmethod
+    def _batch_points(problem_dir: Path) -> dict[int, float]:
+        """Read DMOJ outer-batch points without reimplementing case grading."""
+        init_path = problem_dir / "init.yml"
+        if not init_path.exists():
+            return {}
+        document = yaml.safe_load(init_path.read_text(encoding="utf-8")) or {}
+        default_points = float(document.get("points", 1))
+        result: dict[int, float] = {}
+        batch_number = 0
+        for case in document.get("test_cases") or []:
+            if isinstance(case, dict) and "batched" in case:
+                batch_number += 1
+                result[batch_number] = float(case.get("points", default_points))
+        return result
+
+    @staticmethod
+    def _score_results(test_results: list[dict[str, Any]], batch_points: dict[int, float]) -> int:
+        score = sum(
+            float(item.get("points", 0))
+            for item in test_results
+            if item.get("batch_number") is None
+        )
+        for batch_number, points in batch_points.items():
+            children = [
+                item for item in test_results if item.get("batch_number") == batch_number
+            ]
+            if children and all(item.get("status") == "AC" for item in children):
+                score += points
+        return int(score)
+
     def grade(self, payload: dict[str, Any]) -> dict[str, Any]:
         language = LANGUAGES.get(str(payload.get("language", "")))
         if not language:
@@ -187,6 +223,10 @@ class DMOJAdapter:
                     # Zip-cached pre-extracted flow
                     problem_id = f"oj-{payload['problem']}"
                     judgeenv.clear_problem_dirs_cache()
+
+                problem_dir = PROBLEM_ROOT / problem_id
+                batch_points = self._batch_points(problem_dir)
+                self.packets.reset(batch_points)
 
                 self.judge.begin_grading(Submission(
                     int(payload["id"]), problem_id, language, str(payload["source"]),
@@ -216,7 +256,7 @@ class DMOJAdapter:
                 status = next((code for _flag, code in STATUS_PRIORITY if code in statuses), "AC")
                 return {
                     "status": status,
-                    "score": int(sum(item["points"] for item in test_results)),
+                    "score": self._score_results(test_results, batch_points),
                     "time_ms": max((item["time_ms"] for item in test_results), default=0),
                     "memory_kb": max((item["memory_kb"] for item in test_results), default=0),
                     "test_results": test_results,

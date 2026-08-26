@@ -1,0 +1,6 @@
+unbuffered: true
+interactive: {files: interactor.cpp, type: testlib}
+time_limit: 1.0
+memory_limit: 65536
+test_cases:
+  - {in: cases/case1.in, points: 100, sample: true}

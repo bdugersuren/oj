@@ -4,6 +4,29 @@ import re
 class FlowgorithmTranspileError(Exception):
     pass
 
+
+MAX_FPRG_BYTES = 512 * 1024
+MAX_FPRG_NODES = 5_000
+MAX_FPRG_DEPTH = 100
+
+
+def _validate_xml_tree(root) -> None:
+    stack = [(root, 1)]
+    nodes = 0
+    while stack:
+        node, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_FPRG_NODES:
+            raise FlowgorithmTranspileError("Flowgorithm document has too many nodes")
+        if depth > MAX_FPRG_DEPTH:
+            raise FlowgorithmTranspileError("Flowgorithm document is too deeply nested")
+        if len(node.attrib) > 50 or any(
+            len(str(value).encode("utf-8")) > 64 * 1024
+            for value in node.attrib.values()
+        ):
+            raise FlowgorithmTranspileError("Flowgorithm attributes exceed limits")
+        stack.extend((child, depth + 1) for child in list(node))
+
 def translate_expression(expr: str) -> str:
     if not expr:
         return ""
@@ -35,6 +58,13 @@ def translate_expression(expr: str) -> str:
     return expr
 
 def transpile_fprg_to_python(xml_content: str) -> str:
+    if not isinstance(xml_content, str) or not xml_content.strip():
+        raise FlowgorithmTranspileError("Flowgorithm document is empty")
+    if len(xml_content.encode("utf-8")) > MAX_FPRG_BYTES:
+        raise FlowgorithmTranspileError("Flowgorithm document exceeds 512KB")
+    upper_source = xml_content.upper()
+    if "<!DOCTYPE" in upper_source or "<!ENTITY" in upper_source:
+        raise FlowgorithmTranspileError("DTD and entity declarations are not allowed")
     try:
         root = ET.fromstring(xml_content.strip())
     except Exception as e:
@@ -42,6 +72,7 @@ def transpile_fprg_to_python(xml_content: str) -> str:
         
     if root.tag != "program":
         raise FlowgorithmTranspileError("Root tag must be <program>")
+    _validate_xml_tree(root)
         
     # We will build symbol tables mapping variables to their types
     # First, let's pre-scan all declare tags in all functions to build symbol tables

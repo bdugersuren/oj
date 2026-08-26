@@ -20,8 +20,9 @@ async def get_smtp_config(db: AsyncSession) -> dict:
     result = await db.execute(select(SystemSetting))
     db_settings = {s.key: s.value for s in result.scalars().all()}
 
-    # Resolve settings (DB values override app config)
-    return {
+    # Resolve settings (DB values override app config). Email verification is
+    # opt-in so a fresh deployment cannot create users that never receive mail.
+    config = {
         "host": db_settings.get("smtp_host") or getattr(settings, "SMTP_HOST", None),
         "port": int(db_settings.get("smtp_port") or getattr(settings, "SMTP_PORT", 587) or 587),
         "user": db_settings.get("smtp_user") or getattr(settings, "SMTP_USER", None),
@@ -29,8 +30,20 @@ async def get_smtp_config(db: AsyncSession) -> dict:
         "use_tls": (db_settings.get("smtp_use_tls") == "true") if "smtp_use_tls" in db_settings else getattr(settings, "SMTP_TLS", True),
         "from_email": db_settings.get("smtp_from_email") or getattr(settings, "EMAILS_FROM_EMAIL", None),
         "from_name": db_settings.get("smtp_from_name") or getattr(settings, "EMAILS_FROM_NAME", "OJ Platform"),
-        "enabled": (db_settings.get("smtp_enabled") == "true") if "smtp_enabled" in db_settings else True,
+        "enabled": (
+            db_settings.get("smtp_enabled") == "true"
+            if "smtp_enabled" in db_settings
+            else settings.SMTP_ENABLED
+        ),
     }
+    config["enabled"] = bool(
+        config["enabled"]
+        and config["host"]
+        and config["user"]
+        and config["password"]
+        and config["from_email"]
+    )
+    return config
 
 
 def _send_smtp_sync(config: dict, to_email: str, subject: str, html_content: str):

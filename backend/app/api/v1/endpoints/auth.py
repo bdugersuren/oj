@@ -26,6 +26,7 @@ from app.core.security import (
 from app.core.dependencies import get_current_user, rate_limit_auth
 from app.models.user import User, UserRole, RefreshToken
 from app.models.progression import StudentProgress
+from app.models.progression import StudentLevel
 from app.models.verification_token import VerificationToken
 from app.core.session import set_session_cookies, clear_session_cookies, REFRESH_COOKIE
 from app.services.email import (
@@ -141,6 +142,12 @@ async def register(
     user_in: UserRegisterIn,
     db: AsyncSession = Depends(get_db),
 ):
+    if user_in.role != UserRole.STUDENT:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Багш болон админы эрхийг зөвхөн админ олгоно.",
+        )
+
     # Давхардал шалгах
     result = await db.execute(
         select(User).where(
@@ -163,10 +170,7 @@ async def register(
     # И-мэйл баталгаажуулалт шаардлагагүй тохиолдол:
     # - SMTP идэвхгүй байгаа
     # - Admin эсвэл Teacher role-тэй хэрэглэгч
-    auto_verified = (
-        not smtp_enabled
-        or user_in.role in (UserRole.ADMIN, UserRole.TEACHER)
-    )
+    auto_verified = not smtp_enabled
 
     # Шинэ хэрэглэгч үүсгэх
     user = User(
@@ -184,7 +188,16 @@ async def register(
 
     # Сурагчийн дэвшлийн бичлэг (зөвхөн student role-д)
     if user_in.role == UserRole.STUDENT:
-        progress = StudentProgress(user_id=user.id, current_level_id=1)
+        level_result = await db.execute(
+            select(StudentLevel).where(StudentLevel.name == "Bronze")
+        )
+        bronze = level_result.scalar_one_or_none()
+        if not bronze:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Сургалтын суурь түвшин бэлэн биш байна.",
+            )
+        progress = StudentProgress(user_id=user.id, current_level_id=bronze.id)
         db.add(progress)
 
     if smtp_enabled and not auto_verified:

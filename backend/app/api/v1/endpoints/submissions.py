@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 from sqlalchemy.orm import selectinload
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_role
@@ -33,6 +33,15 @@ class SubmissionCreate(BaseModel):
     language:     str       # "cpp", "python3", "java", "c"
     source_code:  str
     is_sample_test: bool = False
+
+    @field_validator("source_code")
+    @classmethod
+    def bounded_source(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("Source code is empty.")
+        if len(value.encode("utf-8")) > 512 * 1024:
+            raise ValueError("Source code exceeds 512KB.")
+        return value
 
     class Config:
         json_schema_extra = {
@@ -146,6 +155,19 @@ async def submit_code(
             status_code=400,
             detail=f"Дэмжигдэхгүй хэл. Дэмжигдэх хэлүүд: {', '.join(SUPPORTED_LANGUAGES.keys())}",
         )
+
+    # Fail malformed visual documents before creating a persistent queue job.
+    try:
+        if payload.language == "flowgorithm":
+            from app.services.flowgorithm_transpiler import transpile_fprg_to_python
+
+            transpile_fprg_to_python(payload.source_code)
+        elif payload.language == "scratch":
+            from app.services.scratch_transpiler import transpile_scratch_to_python
+
+            transpile_scratch_to_python(payload.source_code)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Visual program invalid: {exc}")
 
     # Бодлого хайх
     p_result = await db.execute(
